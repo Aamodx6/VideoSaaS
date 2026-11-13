@@ -1,28 +1,14 @@
-![alt text](thumbnail.png)
+# Aspect Sentiment · Model
 
-[https://youtu.be/Myo5kizoSk0](https://youtu.be/Myo5kizoSk0)
+Aspect Sentiment scores the sentiment and emotion expressed in spoken segments of video. This repository contains the PyTorch model trained on MELD, SageMaker training and inference scripts, and the AWS monitoring stack. The companion Next.js app handles video uploads, authentication, and API access.
 
-## Overview
+See the [transcript progress report](ASPECT_SENTIMENT_PROGRESS.md) for the team’s deployment evidence and remaining work.
 
-Hi 🤙 In this video, you'll learn how to build a multimodal AI model using PyTorch. The model will accept a video as its input, and predict its sentiment and emotion. When training the model, you'll build features like text, video, and audio encoding, multimodal fusion, and emotion and sentiment classification. After training and deploying the model, you'll build a SaaS around your trained model, where users can run inference on their videos through your API. You'll set up invocation of the deployed model with SageMaker Endpoints, and manage the monthly quotas users have. The SaaS will be built with technologies such as Next.js, React, Tailwind, and Auth.js and is based off of the T3 Stack. You'll be able to build along with me from start to finish.
+The [AWS data architecture](monitoring/DATA_ARCHITECTURE.md) covers the optional CDK extension, data model, rollout, and recovery procedures.
 
-Features:
+In the two-repository workspace, see the [project guide](../README.md), [system architecture](../ARCH.md), and [hosting and endpoint restoration guide](../HOSTING.md).
 
-- 🎥 Video sentiment analysis
-- 📺 Video frame extraction
-- 🎙️ Audio feature extraction
-- 📝 Text embedding with BERT
-- 🔗 Multimodal fusion
-- 📊 Emotion and sentiment classification
-- 🚀 Model training and evaluation
-- 📈 TensorBoard logging
-- 🚀 AWS S3 for video storage
-- 🤖 AWS SageMaker endpoint integration
-- 🔐 User authentication with Auth.js
-- 🔑 API key management
-- 📊 Usage quota tracking
-- 📈 Real-time analysis results
-- 🎨 Modern UI with Tailwind CSS
+The starting implementation follows [Andreas Trolle’s tutorial](https://youtu.be/Myo5kizoSk0). The upstream copyright and license are retained in [LICENSE.MD](LICENSE.MD).
 
 ## Setup
 
@@ -142,7 +128,7 @@ python deployment/deploy_endpoint.py
 
 ### Invoke Endpoint
 
-1. Create a user in IAM with permissions
+Give the SaaS workload role permission to upload videos to its S3 prefix and invoke the configured endpoint. The policy below uses placeholders for your AWS project. Set the actual endpoint name through `AWS_ENDPOINT_NAME`. The monitoring stack can attach equivalent scoped permissions during rollout.
 
 ```
 {
@@ -154,7 +140,7 @@ python deployment/deploy_endpoint.py
                 "s3:PutObject"
             ],
             "Resource": [
-                "arn:aws:s3:::sentiment-analysis-saas/inference/*"
+                "arn:aws:s3:::<INFERENCE_BUCKET>/inference/uploads/*"
             ]
         },
         {
@@ -163,14 +149,14 @@ python deployment/deploy_endpoint.py
                 "sagemaker:InvokeEndpoint"
             ],
             "Resource": [
-                "arn:aws:sagemaker:us-east-1:784061079855:endpoint/sentiment-analysis-endpoint"
+                "arn:aws:sagemaker:<AWS_REGION>:<AWS_ACCOUNT_ID>:endpoint/<ENDPOINT_NAME>"
             ]
         }
     ]
 }
 ```
 
-2. Use the user to invoke endpoint. E.g. use [this NPM library](https://www.npmjs.com/package/@aws-sdk/client-sagemaker-runtime) for invoking from JavaScript:
+The SaaS invokes the endpoint using the [AWS SDK for JavaScript](https://www.npmjs.com/package/@aws-sdk/client-sagemaker-runtime) and the standard credential chain.
 
 ### Access TensorBoard
 
@@ -182,3 +168,31 @@ python deployment/deploy_endpoint.py
 
 3. Open your browser and visit:
    [http://localhost:6006](http://localhost:6006)
+
+## Production observability
+
+The Python CDK stack in [monitoring](monitoring) targets an existing real-time SageMaker endpoint. It provisions log delivery, versioned S3 storage, a partitioned Athena table and workgroup, scheduled drift and accuracy jobs, scaling, alarms and a dashboard. Use the IAM role output by this stack for the monitored endpoint and a dedicated role for the SaaS.
+
+### Rollout
+
+1. In AWS Settings → Projects, confirm the selected Region and review Billing. Use a CDK bootstrap environment in that Region and a deploy role with permission to create the named stack and attach the scoped app policy. The stack expects the existing endpoint log group. For a new environment, first create that exact log group through your platform IaC or bootstrap an endpoint with capture disabled.
+2. From `monitoring/`, install `requirements.txt` into a Python environment and use the CDK CLI to run `cdk synth`, `cdk diff`, and `cdk deploy`. Set the stack configuration below. Start with scheduled jobs and autoscaling disabled. Publish [the runbook](monitoring/RUNBOOK.md) at the configured URL and confirm the SNS email subscription.
+3. On a Linux worker with FFmpeg and `deployment/requirements.txt` installed, unpack the exact release's trained weights into `MODEL_DIR`. Set `MODEL_VERSION`, `MELD_TRAIN_CSV`, `MELD_TRAIN_VIDEO_DIR`, and `MONITORING_BUCKET` to the stack bucket output. Run `python deployment/build_baseline.py`. The script fails rather than overwriting a published version. Use a publisher role allowed to put only `baselines/<model_version>.json`. It scores the MELD training clips with the serving pipeline, using Whisper transcripts for predicted labels and the CSV for ground truth.
+4. Deploy the [SaaS configuration](../ai-video-sentiment-saas/README.md#aws-serving-configuration). Set the endpoint variables below and run `python deployment/deploy_endpoint.py` with SageMaker Python SDK v2 and the AWS credential chain. Set `UPDATE_ENDPOINT=true` for the existing endpoint. Save the prior endpoint config name for rollback. Verify the endpoint reaches `InService` and run an authenticated short-video request through the SaaS. Check for the request in the normalized CloudWatch log group, the date/hour partition in S3 and the dashboard. Verify capture by temporarily raising the sample rate in staging. Native capture contains only the request's opaque S3 reference, because the model output contains the transcript.
+5. Submit feedback for an utterance and verify an accuracy invocation can read its completed hourly counter. Enable jobs and autoscaling via CDK after publishing the baseline and confirming quota, then check the scheduled windows. Use [the example Athena queries](monitoring/queries.sql), [runbook](monitoring/RUNBOOK.md), and [cost estimate](monitoring/COST.md) during rollout.
+
+| Component | Environment variables |
+| --- | --- |
+| CDK required | `ENDPOINT_NAME`, `MODEL_VERSION`, `INFERENCE_BUCKET`, `SAAS_ROLE_ARN`, `RUNBOOK_URL`; `AWS_REGION` defaults to `ap-southeast-2`. |
+| CDK operations | `ALERT_EMAIL`, `ENABLE_MONITORING_JOBS`, `ENABLE_AUTOSCALING`, `LOG_RETENTION_DAYS` (30), `EVENT_RETENTION_DAYS` (30), `CAPTURE_RETENTION_DAYS` (7), `ACCURACY_WINDOW_HOURS` (168), `DRIFT_MIN_SAMPLES` (100). Alarm thresholds are in `monitoring/app.py`. |
+| Endpoint deploy | `INFERENCE_BUCKET`, `ENDPOINT_NAME`, `MODEL_VERSION`, `SAGEMAKER_MODEL_NAME` (unique per release), `SAGEMAKER_EXECUTION_ROLE_ARN` (stack output), `CAPTURE_S3_URI` (stack output), `MODEL_S3_URI` (defaults to `<MODEL_ARTIFACT_PREFIX>/model.tar.gz`), `UPDATE_ENDPOINT`, `CAPTURE_PERCENT` (5), `DRIFT_SAMPLE_RATE` (0.05). |
+| S3 separation | Set matching `INFERENCE_INPUT_PREFIX` and `AWS_INFERENCE_INPUT_PREFIX` on the endpoint and app. Set `MODEL_ARTIFACT_PREFIX` on CDK and the deployment script. For production use separate prefixes, for example `inference/uploads/` and `inference/artifacts/`, and place the weights under the artifact prefix before deploying. |
+| Capacity | `MIN_CAPACITY` (1), `MAX_CAPACITY` (2), `INVOCATIONS_PER_INSTANCE` (4 per minute as an initial load-test target), `SCALE_IN_COOLDOWN` (600 seconds), `SCALE_OUT_COOLDOWN` (120 seconds). |
+
+The handler emits one EMF JSON event for each invocation that reaches the handler, including errors. Firehose normalizes the TorchServe prefix, writes compressed JSON lines to S3 and re-emits bare EMF to CloudWatch. Class, confidence and the sampled embedding represent one randomly selected successful utterance per video. Identifiers are opaque request IDs and application HMACs in the log body only. The application uses one user per tenant until it has an organization model. Keep query access restricted. Treat the sampled embeddings and pseudonyms as sensitive derived data, and use a different model version whenever weights or feature definitions change.
+
+Drift evaluates the last closed UTC hour after a delivery grace period. It skips comparisons with too few samples. `DriftScore` is the maximum of each PSI divided by its threshold and the normalized embedding mean shift divided by its threshold. A score of 1 reaches the threshold. Embedding distance is diagonal Mahalanobis RMS against the baseline covariance. No-speech and confidence comparisons are measured relative to the baseline. Counts and confidence are descriptive; MELD is a short-utterance reference population and its drift scores are not accuracy. Accuracy uses authenticated, deduplicated labels over the last seven days of complete hours and has feedback selection bias.
+
+Run drift math tests from the model repository with `PYTHONPATH=monitoring/runtime python -m unittest discover -s monitoring/tests -v` (PowerShell: set `$env:PYTHONPATH='monitoring/runtime'` first). Load test the endpoint with representative clips before setting the GPU ceiling. The existing SaaS SQLite database and synchronous web request design require separate capacity work before a million-user launch.
+
+Drain pending uploads under the legacy `inference/` prefix before moving the app to `inference/uploads/`. Copy the original weights to `inference/artifacts/model.tar.gz` and use a fresh model resource name for the rollout. At 1M requests per day, average demand alone is about 694 requests per minute. Set maximum capacity from peak requests per minute divided by the measured sustainable per-instance rate, then confirm service quota and headroom for rolling updates. The default ceiling is for a small rollout.

@@ -26,9 +26,9 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid API key" }, { status: 401 });
     }
 
-    const { fileType } = await req.json();
+    const { fileType } = (await req.json()) as { fileType?: unknown };
 
-    if (!fileType || !fileType.match(/\.(mp4|mov|avi)$/i)) {
+    if (typeof fileType !== "string" || !/^\.(mp4|mov|avi)$/i.test(fileType)) {
       return NextResponse.json(
         { error: "Invalid file type. Only .mp4, .mov, .avi are supported" },
         { status: 400 },
@@ -38,19 +38,21 @@ export async function POST(req: Request) {
     // Generate upload url
     const s3Client = new S3Client({
       region: env.AWS_REGION,
-      credentials: {
-        accessKeyId: env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-      },
     });
 
     const id = crypto.randomUUID();
-    const key = `inference/${id}${fileType}`;
+    const extension = fileType.toLowerCase();
+    const key = `${env.AWS_INFERENCE_INPUT_PREFIX}${id}${extension}`;
+    const contentType = {
+      ".mp4": "video/mp4",
+      ".mov": "video/quicktime",
+      ".avi": "video/x-msvideo",
+    }[extension]!;
 
     const command = new PutObjectCommand({
       Bucket: env.AWS_INFERENCE_BUCKET,
       Key: key,
-      ContentType: `video/${fileType.replace(".", "")}`,
+      ContentType: contentType,
     });
 
     const url = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
@@ -67,10 +69,11 @@ export async function POST(req: Request) {
       url,
       fileId: id,
       fileType,
+      contentType,
       key,
     });
   } catch (error) {
-    console.error("Upload error: ", error);
+    console.error("Video upload URL creation failed");
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 },

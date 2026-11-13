@@ -2,11 +2,13 @@ import "~/styles/globals.css";
 
 import { GeistSans } from "geist/font/sans";
 import { type Metadata } from "next";
+import { brand } from "~/lib/brand";
 
 export const metadata: Metadata = {
-  title: "Sentiment Analysis",
-  description: "Sentiment Analysis",
-  icons: [{ rel: "icon", url: "/favicon.ico" }],
+  title: brand.name,
+  applicationName: brand.name,
+  description: brand.description,
+  icons: [{ rel: "icon", url: "/aspect-sentiment.svg", type: "image/svg+xml" }],
 };
 
 export default function RootLayout({

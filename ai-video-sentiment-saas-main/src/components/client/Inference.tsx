@@ -31,6 +31,7 @@ export type Analysis = {
       start_time: number;
       end_time: number;
       text: string;
+      feedback_token?: string;
       emotions: Array<{ label: string; confidence: number }>;
       sentiments: Array<{ label: string; confidence: number }>;
     }>;
@@ -89,42 +90,42 @@ export function Inference({ quota }: InferenceProps) {
 
   return (
     <div className="flex h-fit w-full flex-col gap-3 md:w-1/2">
-      <h2 className="text-ls font-medium text-slate-800">Inference</h2>
+      <h2 className="text-lg font-medium text-slate-800">Analyze a video</h2>
       <UploadVideo onAnalysis={setAnalysis} apiKey={quota.secretKey} />
 
-      <h2 className="mt-2 text-sm text-slate-800">Overall analysis</h2>
-      {averages ? (
+      <h2 className="mt-2 text-sm text-slate-800">Video summary</h2>
+      {averages?.topEmotion && averages.topSentiment ? (
         <div className="flex h-fit w-full flex-wrap items-center justify-center gap-4 rounded-xl border border-gray-200 p-4 sm:gap-8 sm:px-6">
           <div className="flex flex-col items-center">
             <span className="text-sm">Primary emotion</span>
             <span className="text-[40px]">
-              {EMOTION_EMOJI[averages?.topEmotion?.label!]}
+              {EMOTION_EMOJI[averages.topEmotion.label]}
             </span>
             <span className="text-sm text-gray-500">
-              {averages.topEmotion?.confidence.toFixed(3)} (
-              {(averages.topEmotion?.confidence! * 100).toFixed(0)}%)
+              {averages.topEmotion.confidence.toFixed(3)} (
+              {(averages.topEmotion.confidence * 100).toFixed(0)}%)
             </span>
           </div>
           <div className="flex flex-col items-center">
             <span className="text-sm">Primary Sentiment</span>
             <span className="text-[40px]">
-              {SENTIMENT_EMOJI[averages?.topSentiment?.label!]}
+              {SENTIMENT_EMOJI[averages.topSentiment.label]}
             </span>
             <span className="text-sm text-gray-500">
-              {averages.topSentiment?.confidence.toFixed(3)} (
-              {(averages.topSentiment?.confidence! * 100).toFixed(0)}%)
+              {averages.topSentiment.confidence.toFixed(3)} (
+              {(averages.topSentiment.confidence * 100).toFixed(0)}%)
             </span>
           </div>
         </div>
       ) : (
         <div className="flex h-32 w-full items-center justify-center rounded-xl border border-dashed border-gray-200 p-4">
           <span className="text-sm text-gray-400">
-            Upload a video to see overall analysis
+            Upload a video to see its main sentiment and emotion
           </span>
         </div>
       )}
 
-      <h2 className="mt-2 text-sm text-slate-800">Analysis of utterances</h2>
+      <h2 className="mt-2 text-sm text-slate-800">Spoken segments</h2>
       {analysis ? (
         <div className="flex flex-col gap-2">
           {analysis?.analysis.utterances.map((utterance, i) => {
@@ -208,7 +209,7 @@ export function Inference({ quota }: InferenceProps) {
       ) : (
         <div className="flex h-32 w-full items-center justify-center rounded-xl border border-dashed border-gray-200 p-4">
           <span className="text-sm text-gray-400">
-            Upload a video to see analysis results
+            Upload a video to see predictions for each spoken segment
           </span>
         </div>
       )}
