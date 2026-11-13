@@ -1,0 +1,2 @@
+# Whisper 20240930 imports pkg_resources when building its wheel.
+setuptools<82

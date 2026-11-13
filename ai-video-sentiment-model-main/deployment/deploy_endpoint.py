@@ -1,146 +1,68 @@
-"""Create the SageMaker real-time endpoint that serves the sentiment model.
-
-    python deployment/deploy_endpoint.py
-
-PREREQUISITE: whoever runs this needs iam:PassRole on the deploy role.
-Verified on this account: the user `aspect-sentimental-frontead-user` does NOT
-have it, so CreateModel fails with AccessDeniedException. Run this as a
-principal that can pass the role, or grant iam:PassRole to the deploy identity.
-
-Design note -- why this does not use entry_point/source_dir:
-
-Passing those to PyTorchModel makes the SDK *repack* the model. It downloads
-the 505 MB artifact to this machine, injects the code, and re-uploads it.
-Over a normal connection that takes many minutes and can fail outright.
-Instead the code is uploaded once as a small tarball and the container is
-pointed at it with SAGEMAKER_SUBMIT_DIRECTORY, so SageMaker fetches both
-artifacts inside AWS.
-
-Cost warning: a GPU real-time endpoint has no idle state. It bills from
-creation until you delete it:
-
-    aws sagemaker delete-endpoint --endpoint-name sentiment-analysis-endpoint
-"""
-
-import io
 import os
-import sys
-import tarfile
 from pathlib import Path
 
-import boto3
-import sagemaker
+from sagemaker.model_monitor import DataCaptureConfig
 from sagemaker.pytorch import PyTorchModel
-
-REGION = "ap-southeast-2"
-ACCOUNT = "887885502326"
-BUCKET = "aspect-sentiment-lab"
-MODEL_URI = f"s3://{BUCKET}/models/model.tar.gz"
-CODE_KEY = "inference/sourcedir.tar.gz"
-CODE_URI = f"s3://{BUCKET}/{CODE_KEY}"
-
-ENDPOINT_NAME = os.environ.get("ENDPOINT_NAME", "sentiment-analysis-endpoint")
-INSTANCE_TYPE = os.environ.get("ENDPOINT_INSTANCE_TYPE", "ml.g5.xlarge")
-
-# Set SAGEMAKER_ROLE_ARN if the deploy role is named differently. The default
-# matches the role in the architecture diagram.
-ROLE_ARN = os.environ.get(
-    "SAGEMAKER_ROLE_ARN",
-    f"arn:aws:iam::{ACCOUNT}:role/sentiment-analysis-deploy-role",
-)
-
-# Absolute path to this directory. A relative source_dir would resolve against
-# the current working directory, so running from the repo root would package
-# the whole repository -- including dataset/ and venv/.
-HERE = Path(__file__).resolve().parent
-SKIP_DIRS = {"__pycache__", ".ipynb_checkpoints"}
-SKIP_SUFFIX = {".pyc", ".pyo"}
-
-
-def build_code_tarball():
-    """Flat tarball with inference.py at the root, as the container expects."""
-    buf = io.BytesIO()
-    count = 0
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for path in sorted(HERE.rglob("*")):
-            rel = path.relative_to(HERE)
-            if any(part in SKIP_DIRS for part in rel.parts):
-                continue
-            if path.suffix in SKIP_SUFFIX or not path.is_file():
-                continue
-            tar.add(path, arcname=str(rel).replace("\\", "/"))
-            count += 1
-    data = buf.getvalue()
-    print(f"Code     : {len(data):,} bytes ({count} files)")
-    return data
-
-
-def upload_code(s3):
-    s3.put_object(Bucket=BUCKET, Key=CODE_KEY, Body=build_code_tarball())
-    print(f"           {CODE_URI}")
-
-
-def require_artifact(s3):
-    """Fail early, and show exactly which bytes are about to be served."""
-    bucket, _, key = MODEL_URI.replace("s3://", "").partition("/")
-    try:
-        head = s3.head_object(Bucket=bucket, Key=key)
-    except Exception as exc:
-        sys.exit(
-            f"Cannot read {MODEL_URI}: {exc}\n"
-            "Train a model, or run promote_on_complete.py, before deploying."
-        )
-    print(f"Artifact : {MODEL_URI}")
-    print(f"           {head['ContentLength']:,} bytes, "
-          f"modified {head['LastModified']}")
-    return head
+import sagemaker
+from telemetry import DIMENSION_VALUE
 
 
 def deploy_endpoint():
-    s3 = boto3.client("s3", region_name=REGION)
-    require_artifact(s3)
-    upload_code(s3)
-    print(f"Role     : {ROLE_ARN}")
-    print(f"Instance : {INSTANCE_TYPE}")
+    bucket = os.environ["INFERENCE_BUCKET"]
+    endpoint = os.environ["ENDPOINT_NAME"]
+    version = os.environ["MODEL_VERSION"]
+    if not DIMENSION_VALUE.fullmatch(version):
+        raise ValueError("MODEL_VERSION must be a short alphanumeric identifier")
+    sample_rate = float(os.getenv("DRIFT_SAMPLE_RATE", "0.05"))
+    if not 0 <= sample_rate <= 1:
+        raise ValueError("DRIFT_SAMPLE_RATE must be between 0 and 1")
+    capture = int(os.getenv("CAPTURE_PERCENT", "5"))
+    if not 0 <= capture <= 100:
+        raise ValueError("CAPTURE_PERCENT must be between 0 and 100")
+    artifact_prefix = os.getenv("MODEL_ARTIFACT_PREFIX", "inference/artifacts/").strip("/")
+    session = sagemaker.Session(default_bucket=bucket, default_bucket_prefix=artifact_prefix)
+    capture_config = None
+    if capture:
+        capture_config = DataCaptureConfig(
+            enable_capture=True,
+            sampling_percentage=capture,
+            destination_s3_uri=os.environ["CAPTURE_S3_URI"],
+            capture_options=["REQUEST"],
+            json_content_types=["application/json"],
+            sagemaker_session=session,
+        )
+    role = os.environ["SAGEMAKER_EXECUTION_ROLE_ARN"]
 
-    # default_bucket pins SDK artifacts to the project bucket. Left unset, the
-    # SDK falls back to sagemaker-ap-southeast-2-887885502326.
-    session = sagemaker.Session(
-        boto_session=boto3.Session(region_name=REGION),
-        default_bucket=BUCKET,
-    )
+    model_uri = os.getenv("MODEL_S3_URI", f"s3://{bucket}/{artifact_prefix}/model.tar.gz")
 
     model = PyTorchModel(
-        model_data=MODEL_URI,
-        role=ROLE_ARN,
+        model_data=model_uri,
+        role=role,
         framework_version="2.5.1",
         py_version="py311",
-        sagemaker_session=session,
+        entry_point="inference.py",
+        source_dir=str(Path(__file__).resolve().parent),
+        name=os.environ["SAGEMAKER_MODEL_NAME"],
         env={
-            "SAGEMAKER_SUBMIT_DIRECTORY": CODE_URI,
-            "SAGEMAKER_PROGRAM": "inference.py",
+            "PIP_CONSTRAINT": "/opt/ml/model/code/build-constraints.txt",
+            "PIP_BUILD_CONSTRAINT": "/opt/ml/model/code/build-constraints.txt",
+            "ENDPOINT_NAME": endpoint,
+            "MODEL_VERSION": version,
+            "DRIFT_SAMPLE_RATE": str(sample_rate),
+            "INFERENCE_BUCKET": bucket,
+            "INFERENCE_INPUT_PREFIX": os.getenv("INFERENCE_INPUT_PREFIX", "inference/uploads/"),
         },
+        sagemaker_session=session,
     )
 
-    try:
-        predictor = model.deploy(
-            initial_instance_count=1,
-            instance_type=INSTANCE_TYPE,
-            endpoint_name=ENDPOINT_NAME,
-        )
-    except Exception as exc:
-        text = str(exc)
-        if "PassRole" in text:
-            sys.exit(
-                f"Deploy blocked: this identity cannot pass {ROLE_ARN}.\n"
-                "Run as a principal with iam:PassRole, or grant it to this user. "
-                "Nothing was created."
-            )
-        raise
-
-    print(f"Endpoint ready: {ENDPOINT_NAME}")
-    print("Delete it when idle; it bills continuously.")
-    return predictor
+    model.deploy(
+        initial_instance_count=int(os.getenv("INITIAL_INSTANCE_COUNT", "1")),
+        instance_type=os.getenv("INSTANCE_TYPE", "ml.g5.xlarge"),
+        endpoint_name=endpoint,
+        update_endpoint=os.getenv("UPDATE_ENDPOINT", "false").lower() == "true",
+        data_capture_config=capture_config,
+        container_startup_health_check_timeout=int(os.getenv("STARTUP_TIMEOUT_SECONDS", "600")),
+    )
 
 
 if __name__ == "__main__":

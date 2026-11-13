@@ -111,7 +111,7 @@ class MultimodalSentimentModel(nn.Module):
             nn.Linear(64, 3)  # Negative, positive, neutral
         )
 
-    def forward(self, text_inputs, video_frames, audio_features):
+    def forward(self, text_inputs, video_frames, audio_features, return_embedding=False):
         text_features = self.text_encoder(
             text_inputs['input_ids'],
             text_inputs['attention_mask'],
@@ -131,7 +131,10 @@ class MultimodalSentimentModel(nn.Module):
         emotion_output = self.emotion_classifier(fused_features)
         sentiment_output = self.sentiment_classifier(fused_features)
 
-        return {
+        result = {
             'emotions': emotion_output,
             'sentiments': sentiment_output
         }
+        if return_embedding:
+            result['embedding'] = fused_features
+        return result

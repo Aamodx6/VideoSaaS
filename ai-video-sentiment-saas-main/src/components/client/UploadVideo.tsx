@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { FiUpload } from "react-icons/fi";
-import { Analysis } from "./Inference";
+import type { Analysis } from "./Inference";
 
 interface UploadVideoProps {
   apiKey: string;
@@ -33,16 +33,20 @@ function UploadVideo({ apiKey, onAnalysis }: UploadVideoProps) {
       });
 
       if (!res.ok) {
-        const error = await res.json();
-        throw new Error(error?.error || "Failed to get upload URL");
+        const error = (await res.json()) as { error?: string };
+        throw new Error(error?.error ?? "Failed to get upload URL");
       }
 
-      const { url, fileId, key } = await res.json();
+      const { url, contentType, key } = (await res.json()) as {
+        url: string;
+        contentType: string;
+        key: string;
+      };
 
       // 2. Upload file to S3
       const uploadRes = await fetch(url, {
         method: "PUT",
-        headers: { "Content-Type": file.type },
+        headers: { "Content-Type": contentType },
         body: file,
       });
 
@@ -63,19 +67,17 @@ function UploadVideo({ apiKey, onAnalysis }: UploadVideoProps) {
       });
 
       if (!analysisRes.ok) {
-        const error = await analysisRes.json();
-        throw new Error(error?.error || "Failed to analyze video");
+        const error = (await analysisRes.json()) as { error?: string };
+        throw new Error(error?.error ?? "Failed to analyze video");
       }
 
-      const analysis = await analysisRes.json();
+      const analysis = (await analysisRes.json()) as Analysis;
 
-      console.log("Analysis: ", analysis);
       onAnalysis(analysis);
-      setStatus("idle");
     } catch (error) {
       setError(error instanceof Error ? error.message : "Upload failed");
-      console.error("Upload failed", error);
-      throw error;
+    } finally {
+      setStatus("idle");
     }
   };
 
@@ -84,12 +86,14 @@ function UploadVideo({ apiKey, onAnalysis }: UploadVideoProps) {
       <div className="flex w-full cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-gray-300 p-10">
         <input
           type="file"
-          accept="video/mp4,video/mov,video/avi"
+          accept=".mp4,.mov,.avi"
           className="hidden"
           onChange={(e) => {
             const file = e.target.files?.[0];
-            if (file) handleUpload(file);
+            e.target.value = "";
+            if (file) void handleUpload(file);
           }}
+          disabled={status !== "idle"}
           id="video-upload"
         />
         <label

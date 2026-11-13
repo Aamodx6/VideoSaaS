@@ -1,14 +1,22 @@
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import {
   InvokeEndpointCommand,
-  SageMakerRuntime,
   SageMakerRuntimeClient,
 } from "@aws-sdk/client-sagemaker-runtime";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { NextResponse } from "next/server";
+import { z } from "zod";
 import { env } from "~/env";
+import { correlation, emotion, feedbackToken, logSageMakerThrottle, sentiment } from "~/lib/inference-observability";
 import { checkAndUpdateQuota } from "~/lib/quota";
 import { db } from "~/server/db";
+
+const analysisSchema = z.object({
+  model_version: z.string().optional(),
+  utterances: z.array(z.object({
+    start_time: z.number(), end_time: z.number(), text: z.string(),
+    emotions: z.array(z.object({ label: emotion, confidence: z.number() })),
+    sentiments: z.array(z.object({ label: sentiment, confidence: z.number() })),
+  })),
+});
 
 export async function POST(req: Request) {
   try {
@@ -32,10 +40,12 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid API key" }, { status: 401 });
     }
 
-    const { key } = await req.json();
+    const { key } = (await req.json()) as { key?: unknown };
 
-    if (!key) {
-      return NextResponse.json({ error: "Key is required" }, { status: 400 });
+    const prefix = env.AWS_INFERENCE_INPUT_PREFIX;
+    if (typeof key !== "string" || !key.startsWith(prefix) ||
+        !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\.(mp4|mov|avi)$/i.test(key.slice(prefix.length))) {
+      return NextResponse.json({ error: "A valid upload key is required" }, { status: 400 });
     }
 
     const file = await db.videoFile.findUnique({
@@ -70,22 +80,30 @@ export async function POST(req: Request) {
     // Call sagemaker endpoint
     const sagemakerClient = new SageMakerRuntimeClient({
       region: env.AWS_REGION,
-      credentials: {
-        accessKeyId: env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-      },
     });
+    const metadata = correlation(quota.userId);
 
     const command = new InvokeEndpointCommand({
       EndpointName: env.AWS_ENDPOINT_NAME,
       ContentType: "application/json",
+      Accept: "application/json",
+      CustomAttributes: JSON.stringify(metadata),
       Body: JSON.stringify({
         video_path: `s3://${env.AWS_INFERENCE_BUCKET}/${key}`,
       }),
     });
 
     const response = await sagemakerClient.send(command);
-    const analysis = JSON.parse(new TextDecoder().decode(response.Body));
+    const analysis = analysisSchema.parse(JSON.parse(new TextDecoder().decode(response.Body)));
+    const version = analysis.model_version;
+    const time = Date.now();
+    const utterances = analysis.utterances.map((item, index) => ({
+      ...item,
+      feedback_token: version && item.emotions[0] && item.sentiments[0] ? feedbackToken(quota.userId, {
+        id: `${metadata.request_id}:${index}`, version, time,
+        endpoint: env.AWS_ENDPOINT_NAME, emotion: item.emotions[0].label, sentiment: item.sentiments[0].label,
+      }) : undefined,
+    }));
 
     await db.videoFile.update({
       where: { key },
@@ -95,10 +113,17 @@ export async function POST(req: Request) {
     });
 
     return NextResponse.json({
-      analysis,
+      analysis: { ...analysis, utterances },
     });
   } catch (error) {
-    console.error("Analysis error: ", error);
+    if (error instanceof Error && (
+      error.name === "ThrottlingException" ||
+      ("$metadata" in error && (error.$metadata as { httpStatusCode?: number })?.httpStatusCode === 429)
+    )) {
+      logSageMakerThrottle();
+      return NextResponse.json({ error: "Inference capacity is busy" }, { status: 503 });
+    }
+    console.error("Sentiment inference failed");
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 },

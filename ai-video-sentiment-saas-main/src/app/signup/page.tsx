@@ -7,6 +7,8 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { registerUser } from "~/actions/auth";
+import { BrandMark } from "~/components/BrandMark";
+import { brand } from "~/lib/brand";
 import { signupSchema, SignupSchema } from "~/schemas/auth";
 
 export default function SignupPage() {
@@ -56,12 +58,7 @@ export default function SignupPage() {
   return (
     <div className="min-h-screen bg-white">
       <nav className="flex h-16 items-center justify-between border-b border-gray-200 px-10">
-        <div className="flex items-center gap-2">
-          <div className="flex h-8 w-8 items-center justify-center rounded-md bg-gray-800 text-white">
-            SA
-          </div>
-          <span className="text-lg font-medium">Sentiment Analysis</span>
-        </div>
+        <BrandMark />
       </nav>
 
       <main className="flex h-[calc(100vh-4rem)] items-center justify-center">
@@ -69,7 +66,7 @@ export default function SignupPage() {
           <div className="text-center">
             <h2 className="text-2xl font-bold">Create an account</h2>
             <p className="mt-2 text-sm text-gray-600">
-              Sign up to get started with Sentiment Analysis
+              Sign up to get started with {brand.name}
             </p>
           </div>
 

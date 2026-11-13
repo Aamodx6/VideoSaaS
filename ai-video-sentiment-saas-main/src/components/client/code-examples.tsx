@@ -5,7 +5,7 @@ import { useState } from "react";
 function CodeExamples() {
   const [activeTab, setActiveTab] = useState<"ts" | "curl">("ts");
 
-  const tsCode = `const fileType = "mp4";
+  const tsCode = `const fileType = ".mp4";
   // 1. Get upload URL
   const res = await fetch("/api/upload-url", {
     method: "POST",

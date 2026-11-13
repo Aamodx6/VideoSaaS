@@ -11,6 +11,11 @@ import sys
 import json
 import boto3
 import tempfile
+import re
+import shutil
+from urllib.parse import urlsplit
+
+from telemetry import Observation
 
 EMOTION_MAP = {0: "anger", 1: "disgust", 2: "fear",
                3: "joy", 4: "neutral", 5: "sadness", 6: "surprise"}
@@ -18,6 +23,8 @@ SENTIMENT_MAP = {0: "negative", 1: "neutral", 2: "positive"}
 
 
 def install_ffmpeg():
+    if shutil.which("ffmpeg"):
+        return True
     print("Starting Ffmpeg installation...")
 
     subprocess.check_call([sys.executable, "-m", "pip",
@@ -146,7 +153,7 @@ class AudioProcessor:
             mel_spec = mel_spectrogram(waveform)
 
             # Normalize
-            mel_spec = (mel_spec - mel_spec.mean()) / mel_spec.std()
+            mel_spec = (mel_spec - mel_spec.mean()) / mel_spec.std().clamp_min(1e-8)
 
             if mel_spec.size(2) < 300:
                 padding = 300 - mel_spec.size(2)
@@ -170,20 +177,21 @@ class VideoUtteranceProcessor:
         self.video_processor = VideoProcessor()
         self.audio_processor = AudioProcessor()
 
-    def extract_segment(self, video_path, start_time, end_time, temp_dir="/tmp"):
-        os.makedirs(temp_dir, exist_ok=True)
+    def extract_segment(self, video_path, start_time, end_time, temp_dir):
         segment_path = os.path.join(
             temp_dir, f"segment_{start_time}_{end_time}.mp4")
 
         subprocess.run([
-            "ffmpeg", "-i", video_path,
+            "ffmpeg", "-nostdin", "-loglevel", "error", "-i", video_path,
             "-ss", str(start_time),
             "-to", str(end_time),
             "-c:v", "libx264",
             "-c:a", "aac",
+            "-ac", "1",
+            "-ar", "16000",
             "-y",
             segment_path
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 
         if not os.path.exists(segment_path) or os.path.getsize(segment_path) == 0:
             raise ValueError("Segment extraction failed: " + segment_path)
@@ -197,20 +205,16 @@ def download_from_s3(s3_uri):
     key = "/".join(s3_uri.split("/")[3:])
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
-        s3_client.download_file(bucket, key, temp_file.name)
-        return temp_file.name
+        local_path = temp_file.name
+    try:
+        s3_client.download_file(bucket, key, local_path)
+    except Exception:
+        os.remove(local_path)
+        raise
+    return local_path
 
 
-def input_fn(request_body, request_content_type):
-    if request_content_type == "application/json":
-        input_data = json.loads(request_body)
-        s3_uri = input_data['video_path']
-        local_path = download_from_s3(s3_uri)
-        return {"video_path": local_path}
-    raise ValueError(f"Unsupported content type: {request_content_type}")
-
-
-def output_fn(prediction, response_content_type):
+def encode_prediction(prediction, response_content_type):
     if response_content_type == "application/json":
         return json.dumps(prediction)
     raise ValueError(f"Unsupported content type: {response_content_type}")
@@ -248,51 +252,105 @@ def model_fn(model_dir):
     }
 
 
-def predict_fn(input_data, model_dict):
+def request_stats(video_path, observation):
+    with observation.stage("frame"):
+        capture = cv2.VideoCapture(video_path)
+        try:
+            frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+            fps = capture.get(cv2.CAP_PROP_FPS)
+            if np.isfinite(frames) and frames > 0:
+                observation.stats["frame_count"] = int(frames)
+                if np.isfinite(fps) and fps > 0:
+                    observation.stats["video_duration"] = frames / fps
+        finally:
+            capture.release()
+
+
+def transform_fn(model, request_body, content_type, accept, context=None):
+    observation = Observation()
+    failed = True
+    try:
+        with observation.stage("input"):
+            if (content_type or "").partition(";")[0].strip().lower() != "application/json":
+                raise ValueError("Unsupported input content type")
+            payload = json.loads(request_body)
+            if context is not None and hasattr(context, "get_all_request_header"):
+                try:
+                    headers = {k.lower(): v for k, v in context.get_all_request_header(0).items()}
+                    attributes = headers.get("x-amzn-sagemaker-custom-attributes")
+                    if attributes:
+                        observation.identify(json.loads(attributes))
+                except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+                    pass
+            uri = urlsplit(payload["video_path"])
+            bucket = os.getenv("INFERENCE_BUCKET")
+            if uri.scheme != "s3" or not uri.netloc or not uri.path.lstrip("/") or uri.query or uri.fragment:
+                raise ValueError("Expected an S3 object URI")
+            prefix = "/" + os.getenv("INFERENCE_INPUT_PREFIX", "inference/uploads/")
+            if bucket and (uri.netloc != bucket or not uri.path.startswith(prefix)):
+                raise ValueError("Video is outside the configured inference input location")
+            if bucket:
+                upload_key = uri.path[len(prefix):]
+                single_key = r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\.(?:mp4|mov|avi)"
+                tenant_key = r"(?:[a-f0-9-]{32,36}/){2}[a-f0-9]{32}\.mp4"
+                if not re.fullmatch(f"(?:{single_key}|{tenant_key})", upload_key, re.IGNORECASE):
+                    raise ValueError("Expected an opaque video upload key")
+            local_path = download_from_s3(payload["video_path"])
+        try:
+            with tempfile.TemporaryDirectory(prefix="sentiment-") as temp_dir:
+                prediction = predict_video(local_path, model, temp_dir, observation)
+        finally:
+            os.remove(local_path)
+        with observation.stage("output"):
+            prediction["model_version"] = observation.model_version
+            response = encode_prediction(prediction, accept if accept not in (None, "*/*") else "application/json")
+        failed = False
+        return response, "application/json"
+    except Exception:
+        observation.error_type = observation.error_type or "internal_error"
+        # TorchServe logs exceptions. Suppress input values, paths and subprocess stderr.
+        raise RuntimeError(observation.error_type) from None
+    finally:
+        print(json.dumps(observation.event(failed), separators=(",", ":"), allow_nan=False), flush=True)
+
+
+def predict_video(video_path, model_dict, temp_dir, observation=None):
+    observation = observation or Observation(sample_rate=0)
     model = model_dict['model']
     tokenizer = model_dict['tokenizer']
     device = model_dict['device']
-    video_path = input_data['video_path']
 
-    result = model_dict['transcriber'].transcribe(
-        video_path, word_timestamps=True)
+    request_stats(video_path, observation)
+    with observation.stage("audio"):
+        audio = whisper.load_audio(video_path)
+        rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64)))) if audio.size else 0.0
+        observation.stats["audio_loudness"] = float(max(-96.0, 20 * np.log10(max(rms, 1e-5))))
+    with observation.stage("text"):
+        result = model_dict['transcriber'].transcribe(audio, word_timestamps=True)
+        observation.stats["has_speech"] = bool(result["segments"])
 
     utterance_processor = VideoUtteranceProcessor()
     predictions = []
 
     for segment in result["segments"]:
-        # Initialised here so the finally block below is safe even when
-        # extract_segment is what raised. Without this, a failed extraction
-        # raised UnboundLocalError inside finally, which escapes predict_fn
-        # and kills the whole request instead of skipping one segment.
         segment_path = None
         try:
-            segment_path = utterance_processor.extract_segment(
-                video_path,
-                segment["start"],
-                segment["end"]
-            )
-
-            video_frames = utterance_processor.video_processor.process_video(
-                segment_path)
-            audio_features = utterance_processor.audio_processor.extract_features(
-                segment_path)
-            text_inputs = tokenizer(
-                segment["text"],
-                padding="max_length",
-                truncation=True,
-                max_length=128,
-                return_tensors="pt"
-            )
-
-            # Move to device
-            text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-            video_frames = video_frames.unsqueeze(0).to(device)
-            audio_features = audio_features.unsqueeze(0).to(device)
+            with observation.stage("frame"):
+                segment_path = utterance_processor.extract_segment(
+                    video_path, segment["start"], segment["end"], temp_dir)
+                video_frames = utterance_processor.video_processor.process_video(segment_path)
+            with observation.stage("audio"):
+                audio_features = utterance_processor.audio_processor.extract_features(segment_path)
+            with observation.stage("text"):
+                text_inputs = tokenizer(segment["text"], padding="max_length", truncation=True,
+                                        max_length=128, return_tensors="pt")
 
             # Get predictions
-            with torch.inference_mode():
-                outputs = model(text_inputs, video_frames, audio_features)
+            with observation.stage("fusion"), torch.inference_mode():
+                text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+                video_frames = video_frames.unsqueeze(0).to(device)
+                audio_features = audio_features.unsqueeze(0).to(device)
+                outputs = model(text_inputs, video_frames, audio_features, return_embedding=observation.sampled)
                 emotion_probs = torch.softmax(outputs["emotions"], dim=1)[0]
                 sentiment_probs = torch.softmax(
                     outputs["sentiments"], dim=1)[0]
@@ -300,26 +358,33 @@ def predict_fn(input_data, model_dict):
                 emotion_values, emotion_indices = torch.topk(emotion_probs, 3)
                 sentiment_values, sentiment_indices = torch.topk(
                     sentiment_probs, 3)
+                embedding = outputs["embedding"][0].tolist() if observation.sampled else None
+                emotion_values, emotion_indices = emotion_values.tolist(), emotion_indices.tolist()
+                sentiment_values, sentiment_indices = sentiment_values.tolist(), sentiment_indices.tolist()
 
             predictions.append({
                 "start_time": segment["start"],
                 "end_time": segment["end"],
                 "text": segment["text"],
                 "emotions": [
-                    {"label": EMOTION_MAP[idx.item()], "confidence": conf.item()} for idx, conf in zip(emotion_indices, emotion_values)
+                    {"label": EMOTION_MAP[idx], "confidence": conf} for idx, conf in zip(emotion_indices, emotion_values)
                 ],
                 "sentiments": [
-                    {"label": SENTIMENT_MAP[idx.item()], "confidence": conf.item()} for idx, conf in zip(sentiment_indices, sentiment_values)
+                    {"label": SENTIMENT_MAP[idx], "confidence": conf} for idx, conf in zip(sentiment_indices, sentiment_values)
                 ]
             })
+            observation.segment(predictions[-1]["emotions"][0], predictions[-1]["sentiments"][0], embedding)
 
-        except Exception as e:
-            print("Segment failed inference: " + str(e))
+        except Exception:
+            observation.segment_errors += 1
+            observation.error_type = observation.error_type or "segment_error"
 
         finally:
             # Cleanup
-            if segment_path and os.path.exists(segment_path):
+            if segment_path is not None and os.path.exists(segment_path):
                 os.remove(segment_path)
+    if result["segments"] and not predictions:
+        raise RuntimeError("Inference failed for all transcribed segments")
     return {"utterances": predictions}
 
 
