@@ -1,11 +1,10 @@
 import { PrismaAdapter } from "@auth/prisma-adapter";
 import { type DefaultSession, type NextAuthConfig } from "next-auth";
 import Credentials from "next-auth/providers/credentials";
-import DiscordProvider from "next-auth/providers/discord";
-import { loginSchema } from "~/schemas/auth";
 import bcrypt from "bcryptjs";
-
+import { loginSchema } from "~/schemas/auth";
 import { db } from "~/server/db";
+import { edgeAuthConfig } from "./edge-config";
 
 /**
  * Module augmentation for `next-auth` types. Allows us to add custom properties to the `session`
@@ -34,10 +33,8 @@ declare module "next-auth" {
  * @see https://next-auth.js.org/configuration/options
  */
 export const authConfig = {
-  trustHost: true,
-  pages: {
-    signIn: "/login",
-  },
+  ...edgeAuthConfig,
+  adapter: PrismaAdapter(db),
   providers: [
     Credentials({
       name: "Credentials",
@@ -84,17 +81,4 @@ export const authConfig = {
      * @see https://next-auth.js.org/providers/github
      */
   ],
-  session: {
-    strategy: "jwt",
-  },
-  adapter: PrismaAdapter(db),
-  callbacks: {
-    session: ({ session, token }) => ({
-      ...session,
-      user: {
-        ...session.user,
-        id: token.sub,
-      },
-    }),
-  },
 } satisfies NextAuthConfig;

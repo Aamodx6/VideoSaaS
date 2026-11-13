@@ -1,4 +1,4 @@
-import { auth } from "./server/auth";
+import { auth } from "./server/auth/edge";
 
 export default auth((req) => {
   const isAuthenticated = !!req.auth;

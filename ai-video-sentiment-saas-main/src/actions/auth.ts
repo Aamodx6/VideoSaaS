@@ -1,7 +1,7 @@
 "use server";
 
 import { hash } from "bcryptjs";
-import { signupSchema, SignupSchema } from "~/schemas/auth";
+import { signupSchema, type SignupSchema } from "~/schemas/auth";
 import { db } from "~/server/db";
 import crypto from "crypto";
 

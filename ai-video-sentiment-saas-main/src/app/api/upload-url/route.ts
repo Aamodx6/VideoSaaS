@@ -73,7 +73,7 @@ export async function POST(req: Request) {
       key,
     });
   } catch (error) {
-    console.error("Video upload URL creation failed");
+    console.error("Video upload URL creation failed:", error);
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 },

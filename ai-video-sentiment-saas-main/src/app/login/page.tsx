@@ -7,7 +7,7 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { BrandMark } from "~/components/BrandMark";
-import { loginSchema, LoginSchema } from "~/schemas/auth";
+import { loginSchema, type LoginSchema } from "~/schemas/auth";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -40,7 +40,7 @@ export default function LoginPage() {
             : "Something went wrong",
         );
       }
-    } catch (error) {
+    } catch {
       setError("Something went wrong");
     } finally {
       setLoading(false);
