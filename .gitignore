@@ -73,8 +73,10 @@ tensorboard_logs/
 *.safetensors
 
 # Environment variables & secrets
-.env
-.env*.local
+.env*
+*.env*
+!.env.example
+
 *.pem
 *.key
 
