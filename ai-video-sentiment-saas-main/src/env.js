@@ -24,6 +24,13 @@ export const env = createEnv({
     FEEDBACK_SIGNING_SECRET: z.string().min(32).optional(),
     AWS_FEEDBACK_TABLE: z.string().optional(),
     FEEDBACK_RETENTION_DAYS: z.coerce.number().int().min(14).max(365).default(30),
+    DATABASE_URL_UNPOOLED: z.string().optional(),
+    NEON_AUTH_BASE_URL: z.string().optional(),
+    NEON_AUTH_JWKS_URL: z.string().optional(),
+    NEON_REALTIME_URL: z.string().optional(),
+    NEON_REALTIME_SECRET: z.string().optional(),
+    NEON_AI_GATEWAY_TOKEN: z.string().optional(),
+    NEON_AI_GATEWAY_BASE_URL: z.string().optional(),
   },
 
   /**
@@ -52,6 +59,13 @@ export const env = createEnv({
     FEEDBACK_SIGNING_SECRET: process.env.FEEDBACK_SIGNING_SECRET,
     AWS_FEEDBACK_TABLE: process.env.AWS_FEEDBACK_TABLE,
     FEEDBACK_RETENTION_DAYS: process.env.FEEDBACK_RETENTION_DAYS,
+    DATABASE_URL_UNPOOLED: process.env.DATABASE_URL_UNPOOLED,
+    NEON_AUTH_BASE_URL: process.env.NEON_AUTH_BASE_URL,
+    NEON_AUTH_JWKS_URL: process.env.NEON_AUTH_JWKS_URL,
+    NEON_REALTIME_URL: process.env.NEON_REALTIME_URL,
+    NEON_REALTIME_SECRET: process.env.NEON_REALTIME_SECRET,
+    NEON_AI_GATEWAY_TOKEN: process.env.NEON_AI_GATEWAY_TOKEN,
+    NEON_AI_GATEWAY_BASE_URL: process.env.NEON_AI_GATEWAY_BASE_URL,
   },
   /**
    * Run `build` or `dev` with `SKIP_ENV_VALIDATION` to skip env validation. This is especially

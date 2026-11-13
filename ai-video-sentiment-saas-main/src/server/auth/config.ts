@@ -69,6 +69,7 @@ export const authConfig = {
             name: user.name,
           };
         } catch (error) {
+          console.error("NextAuth authorize error:", error);
           return null;
         }
       },

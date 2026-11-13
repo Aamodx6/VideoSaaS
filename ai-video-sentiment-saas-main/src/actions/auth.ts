@@ -41,6 +41,10 @@ export async function registerUser(data: SignupSchema) {
 
     return { success: true };
   } catch (error) {
-    return { error: "Something went wrong" };
+    console.error("registerUser error:", error);
+    return {
+      error:
+        error instanceof Error ? error.message : "Something went wrong",
+    };
   }
 }
