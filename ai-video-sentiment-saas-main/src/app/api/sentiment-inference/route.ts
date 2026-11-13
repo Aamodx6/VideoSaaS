@@ -123,7 +123,7 @@ export async function POST(req: Request) {
       logSageMakerThrottle();
       return NextResponse.json({ error: "Inference capacity is busy" }, { status: 503 });
     }
-    console.error("Sentiment inference failed");
+    console.error("Sentiment inference failed:", error);
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 },
