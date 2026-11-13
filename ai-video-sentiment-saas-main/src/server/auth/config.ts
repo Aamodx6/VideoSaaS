@@ -34,6 +34,7 @@ declare module "next-auth" {
  * @see https://next-auth.js.org/configuration/options
  */
 export const authConfig = {
+  trustHost: true,
   pages: {
     signIn: "/login",
   },
