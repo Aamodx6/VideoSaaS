@@ -1,0 +1,86 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Python environments & cache
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Next.js & Web builds
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+.vercel
+
+# Databases
+*.sqlite
+*.sqlite-journal
+*.sqlite3
+*.db
+
+# Logs & Metrics
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+tensorboard_logs/
+**/runs/
+*.tfevents.*
+
+# Datasets & raw media
+**/dataset/MELD.Raw/
+**/dataset/dev/*
+!**/dataset/dev/.gitkeep
+**/dataset/test/*
+!**/dataset/test/.gitkeep
+**/dataset/train/*
+!**/dataset/train/.gitkeep
+
+# Model weights & archives
+**/deployment/model/*
+!**/deployment/model/.gitkeep
+**/deployment/model_normalized/*
+!**/deployment/model_normalized/.gitkeep
+*.tar.gz
+*.pth
+*.pt
+*.bin
+*.onnx
+*.safetensors
+
+# Environment variables & secrets
+.env
+.env*.local
+*.pem
+*.key
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
