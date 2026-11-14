@@ -1,5 +1,9 @@
 # Whole-project verification
 
+## Guardrail branch validation
+
+Local guardrail verification covers 27 Python tests, eight frontend contract tests, the TypeScript check, a production Next.js build, and PostgreSQL tests for safety-role permissions and subject isolation. CDK synthesis includes the scan workflow, recovery, safety database secret, and the guarded API. Managed AWS scans, real model-policy fitting, and the hosted moderation flow need staging resources before live validation. These local results use mocked managed-service calls.
+
 ## Passed
 
 - Production Next.js build completed. The browser test initially hit Auth.js `UntrustedHost`. Setting `AUTH_URL` to the canonical origin fixed signup and sign-in. The environment template now documents this setting.

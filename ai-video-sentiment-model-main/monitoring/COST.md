@@ -1,5 +1,9 @@
 # Aspect Sentiment monitoring cost and inference options
 
+## Moderation cost at one million uploads per day
+
+Budget moderation separately from inference and monitoring. At 30 million uploads per 30-day month, the six-image first pass uses up to 180 million Rekognition image calls before early exits. Full-video usage is `upload count × borderline fraction × average borderline clip minutes`. Transcribe usage is `eligible upload count × average billable audio duration`, including any per-request minimum. GuardDuty scales with scanned bytes and object count. Step Functions usage scales with polling transitions and retries. Quarantine storage scales with daily uploaded bytes, retention and the extra checked copies. Apply Sydney list rates and measure the escalation fraction in staging before extrapolating. [Rekognition pricing](https://aws.amazon.com/rekognition/pricing/) · [Transcribe pricing](https://aws.amazon.com/transcribe/pricing/) · [GuardDuty pricing](https://aws.amazon.com/guardduty/pricing/) · [Step Functions pricing](https://aws.amazon.com/step-functions/pricing/)
+
 ## Lowest-cost demo and staging
 
 - Use the local Next.js app and SQLite for demos. Keep the full data stack opt-in. Aurora with a failover reader and proxy, Valkey, and interface endpoints add recurring charges even at low traffic.

@@ -24,6 +24,29 @@ class DataPipeline(Construct):
             "RESULTS": data.results.bucket_name, "ENDPOINT": endpoint_name,
             "CACHE_HOST": data.valkey.attr_endpoint_address,
         }
+        quarantine = None
+        if os.getenv("ENABLE_MODERATION", "1") == "1":
+            from moderation import workflow
+            from aws_cdk import aws_s3 as s3
+            quarantine = data.bucket("Quarantine", None, cors=True, post=True)
+            retention = int(os.getenv("QUARANTINE_RETENTION_DAYS", "2"))
+            hold = int(os.getenv("BLOCK_RETENTION_DAYS", "0"))
+            if not 1 <= retention <= 30 or not 0 <= hold <= 365:
+                raise ValueError("Invalid quarantine or blocked-content retention")
+            for prefix in ("uploads/", "checked/", "toxicity/"):
+                quarantine.add_lifecycle_rule(prefix=prefix, expiration=cdk.Duration.days(retention),
+                    noncurrent_version_expiration=cdk.Duration.days(1))
+            quarantine.add_lifecycle_rule(prefix="hold/", expiration=cdk.Duration.days(max(1, hold)),
+                noncurrent_version_expiration=cdk.Duration.days(1))
+            env["QUARANTINE"] = quarantine.bucket_name
+            env["BLOCK_RETENTION_DAYS"] = str(hold)
+            env["MAX_VIDEO_BYTES"] = os.getenv("MAX_VIDEO_BYTES", str(128 * 1024**2))
+            env["SAFETY_CLUSTER_ARN"] = data.safety_cluster.cluster_arn
+            env["SAFETY_SECRET_ARN"] = data.safety_secret.secret_arn
+            env["STRIKE_THROTTLE_COUNT"] = os.getenv("STRIKE_THROTTLE_COUNT", "3")
+            env["STRIKE_SUSPEND_COUNT"] = os.getenv("STRIKE_SUSPEND_COUNT", "5")
+            moderation = workflow(self, data, quarantine, env)
+            env["MODERATION_WORKFLOW"] = moderation.state_machine_arn
         queue_key = data.key("JobQueueKey")
         dlq = sqs.Queue(self, "DeadLetters", encryption=sqs.QueueEncryption.KMS,
                         encryption_master_key=queue_key, retention_period=cdk.Duration.days(14))
@@ -35,6 +58,9 @@ class DataPipeline(Construct):
         env.update({"QUEUE": queue.queue_url, "NOTIFICATIONS": notifications.topic_arn,
                     "RESULT_BUS": result_bus.event_bus_name})
         handler = stack.function("DataJobsApi", "data_jobs.api", env, timeout=15)
+        if quarantine:
+            data.grant_safety_access(handler)
+            self.vpc_data_api(data)
         # The public API validates an opaque product key. Rate limits apply at
         # the gateway and, after authentication, per tenant in the handler.
         handler.add_to_role_policy(iam.PolicyStatement(actions=[
@@ -48,32 +74,71 @@ class DataPipeline(Construct):
         data.api_keys.grant_read_data(handler)
         data.jobs.grant(handler, "dynamodb:GetItem", "dynamodb:PutItem")
         data.quotas.grant(handler, "dynamodb:GetItem", "dynamodb:UpdateItem")
-        data.videos.grant_put(handler, "uploads/*")
-        data.videos.grant_read(handler, "uploads/*")
+        upload_bucket = quarantine or data.videos
+        upload_bucket.grant_put(handler, "uploads/*")
+        upload_bucket.grant_read(handler, "uploads/*")
         data.results.grant_read(handler, "output/*")
         rest = api.RestApi(self, "JobsApi", deploy_options=api.StageOptions(
             throttling_rate_limit=100, throttling_burst_limit=200, data_trace_enabled=False))
         jobs = rest.root.add_resource("jobs")
         for path, method in ((rest.root.add_resource("uploads"), "POST"), (jobs, "POST"),
+                             (rest.root.add_resource("quota"), "GET"),
                              (jobs.add_resource("{jobId}"), "GET")):
             path.add_method(method, api.LambdaIntegration(handler), authorization_type=api.AuthorizationType.IAM)
+        if quarantine:
+            reviewer = stack.function("ModerationReviewer", "moderate.review", {
+                **env, "MODERATION_REVIEW_SCORE": os.getenv("MODERATION_REVIEW_SCORE", "65"),
+                "MODERATION_BLOCK_SCORE": os.getenv("MODERATION_BLOCK_SCORE", "90")})
+            data.jobs.grant(reviewer, "dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query")
+            data.grant_safety_access(reviewer)
+            quarantine.grant_read(reviewer, "uploads/*")
+            data.videos.grant_put(reviewer, "uploads/*")
+            data.videos.grant_read(reviewer, "uploads/*")
+            quarantine.grant_read_write(reviewer, "hold/*")
+            quarantine.grant_delete(reviewer)
+            reviewer.add_to_role_policy(iam.PolicyStatement(
+                actions=["s3:ListBucketVersions"], resources=[quarantine.bucket_arn]))
+            reviewer.add_to_role_policy(iam.PolicyStatement(
+                actions=["transcribe:GetTranscriptionJob", "transcribe:DeleteTranscriptionJob"],
+                resources=[stack.format_arn(service="transcribe", resource="transcription-job", resource_name=name + "*")
+                           for name in ("language-", "moderation-")]))
+            review_queue = rest.root.add_resource("review").add_resource("{tenant}")
+            review_queue.add_method("GET", api.LambdaIntegration(reviewer), authorization_type=api.AuthorizationType.IAM)
+            review = review_queue.add_resource("{jobId}")
+            for verb in ("GET", "POST"):
+                review.add_method(verb, api.LambdaIntegration(reviewer), authorization_type=api.AuthorizationType.IAM)
+            reviewer_arn = os.environ["MODERATION_REVIEW_ROLE_ARN"]
+            if reviewer_arn == os.environ["SAAS_ROLE_ARN"]:
+                raise ValueError("Reviewer and application roles must be different")
+            review_role = iam.Role.from_role_arn(self, "ReviewCaller", reviewer_arn, mutable=True)
+            review_role.add_to_principal_policy(iam.PolicyStatement(
+                actions=["execute-api:Invoke"], resources=[rest.arn_for_execute_api(method="*", path="/review/*")]))
+            rest.add_to_resource_policy(iam.PolicyStatement(
+                effect=iam.Effect.DENY, principals=[iam.AnyPrincipal()], actions=["execute-api:Invoke"],
+                resources=["execute-api:/*/*/review/*"],
+                conditions={"ArnNotEquals": {"aws:PrincipalArn": reviewer_arn}}))
         data.output("JobsApiUrl", rest.url)
         data.output("NotificationTopic", notifications.topic_arn)
         saas = iam.Role.from_role_arn(self, "SaasCaller", os.environ["SAAS_ROLE_ARN"], mutable=True)
-        for method, path in (("POST", "/uploads"), ("POST", "/jobs"), ("GET", "/jobs/*")):
+        for method, path in (("POST", "/uploads"), ("POST", "/jobs"), ("GET", "/jobs/*"), ("GET", "/quota")):
             saas.add_to_principal_policy(iam.PolicyStatement(
                 actions=["execute-api:Invoke"], resources=[rest.arn_for_execute_api(method=method, path=path)]))
+        data.api_keys.grant(saas, "dynamodb:PutItem", "dynamodb:GetItem")
 
         dispatch = stack.function("DataDispatch", "data_jobs.dispatch", env)
         dispatch.add_event_source(sources.DynamoEventSource(
             data.jobs, starting_position=lam.StartingPosition.TRIM_HORIZON,
             batch_size=10, retry_attempts=5, bisect_batch_on_error=True,
             on_failure=sources.SqsDlq(dlq),
-            filters=[lam.FilterCriteria.filter({"eventName": ["INSERT"], "dynamodb": {
-                "NewImage": {"status": {"S": ["QUEUED"]}}}})],
+            filters=[lam.FilterCriteria.filter({"eventName": ["INSERT", "MODIFY"], "dynamodb": {
+                "NewImage": {"status": {"S": ["QUEUED", "PENDING_MODERATION"] if quarantine else ["QUEUED"]}}}})],
         ))
         queue.grant_send_messages(dispatch)
+        if quarantine:
+            moderation.grant_start_execution(dispatch)
         worker = stack.function("DataWorker", "data_jobs.submit", env, timeout=60)
+        if quarantine:
+            data.grant_safety_access(worker)
         worker.add_event_source(sources.SqsEventSource(queue, batch_size=1))
         data.jobs.grant(worker, "dynamodb:GetItem", "dynamodb:UpdateItem")
         data.videos.grant_put(worker, "requests/*")
@@ -116,11 +181,19 @@ class DataPipeline(Construct):
         data.output("AsyncModelExecutionRoleArn", execution.role_arn)
         # Stage the artifact into the generated bucket before enabling creation.
         if os.getenv("CREATE_ASYNC_ENDPOINT") == "1":
+            if os.getenv("REQUIRE_QUALITY_POLICY", "1") == "1" and not os.getenv("QUALITY_POLICY_PATH"):
+                raise ValueError("Async serving requires a calibrated QUALITY_POLICY_PATH")
             model = sm.CfnModel(self, "Model", execution_role_arn=execution.role_arn,
                 primary_container=sm.CfnModel.ContainerDefinitionProperty(
                     image=image, model_data_url=data.artifacts.s3_url_for_object(artifact),
                     environment={"INFERENCE_BUCKET": data.videos.bucket_name,
+                                 "SAGEMAKER_PROGRAM": "inference.py",
+                                 "SAGEMAKER_SUBMIT_DIRECTORY": "/opt/ml/model/code",
+                                 "PIP_CONSTRAINT": "/opt/ml/model/code/build-constraints.txt",
+                                 "PIP_BUILD_CONSTRAINT": "/opt/ml/model/code/build-constraints.txt",
                                  "INFERENCE_INPUT_PREFIX": "uploads/",
+                                 "QUALITY_POLICY_PATH": os.getenv("QUALITY_POLICY_PATH", ""),
+                                 "REQUIRE_QUALITY_POLICY": os.getenv("REQUIRE_QUALITY_POLICY", "1"),
                                  "ENDPOINT_NAME": endpoint_name, "MODEL_VERSION": stack.version}))
             config = sm.CfnEndpointConfig(self, "Config",
                 production_variants=[sm.CfnEndpointConfig.ProductionVariantProperty(
@@ -166,3 +239,10 @@ class DataPipeline(Construct):
         cw.Alarm(self, "QueueDeadLetters", metric=dlq.metric_approximate_number_of_messages_visible(),
                  threshold=1, evaluation_periods=1, comparison_operator=cw.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
                  alarm_description=f"Async queue dead letters. Runbook {stack.runbook}#async-recovery")
+
+    def vpc_data_api(self, data):
+        from aws_cdk import aws_ec2 as ec2
+        endpoint_sg = ec2.SecurityGroup(self, "DataApiEndpointSecurityGroup", vpc=data.vpc)
+        endpoint_sg.add_ingress_rule(data.app_sg, ec2.Port.tcp(443))
+        data.vpc.add_interface_endpoint("SafetyDataApi", service=ec2.InterfaceVpcEndpointAwsService.RDS_DATA,
+                                         security_groups=[endpoint_sg])
