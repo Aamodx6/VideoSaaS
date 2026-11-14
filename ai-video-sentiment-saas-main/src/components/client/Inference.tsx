@@ -93,13 +93,16 @@ export function Inference({ quota }: InferenceProps) {
       <h2 className="text-lg font-medium text-slate-800">Analyze a video</h2>
       <UploadVideo onAnalysis={setAnalysis} apiKey={quota.secretKey} />
 
-      <h2 className="mt-2 text-sm text-slate-800">Video summary</h2>
+      <h2 className="mt-2 text-sm font-medium text-slate-800">Overall analysis</h2>
       {averages?.topEmotion && averages.topSentiment ? (
         <div className="flex h-fit w-full flex-wrap items-center justify-center gap-4 rounded-xl border border-gray-200 p-4 sm:gap-8 sm:px-6">
           <div className="flex flex-col items-center">
-            <span className="text-sm">Primary emotion</span>
+            <span className="text-sm font-medium text-gray-600">Primary emotion</span>
             <span className="text-[40px]">
               {EMOTION_EMOJI[averages.topEmotion.label]}
+            </span>
+            <span className="text-sm font-semibold capitalize text-gray-800">
+              {averages.topEmotion.label}
             </span>
             <span className="text-sm text-gray-500">
               {averages.topEmotion.confidence.toFixed(3)} (
@@ -107,9 +110,12 @@ export function Inference({ quota }: InferenceProps) {
             </span>
           </div>
           <div className="flex flex-col items-center">
-            <span className="text-sm">Primary Sentiment</span>
+            <span className="text-sm font-medium text-gray-600">Primary Sentiment</span>
             <span className="text-[40px]">
               {SENTIMENT_EMOJI[averages.topSentiment.label]}
+            </span>
+            <span className="text-sm font-semibold capitalize text-gray-800">
+              {averages.topSentiment.label}
             </span>
             <span className="text-sm text-gray-500">
               {averages.topSentiment.confidence.toFixed(3)} (
