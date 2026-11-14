@@ -2,6 +2,7 @@ import { defaultProvider } from "@aws-sdk/credential-provider-node";
 import { Hash } from "@smithy/hash-node";
 import { SignatureV4 } from "@smithy/signature-v4";
 import { NextResponse } from "next/server";
+import { registerGuardedKey } from "~/lib/guardrails";
 
 type Context = { params: Promise<{ operation?: string[] }> };
 
@@ -16,7 +17,8 @@ async function proxy(request: Request, context: Context) {
     (name === "uploads" || name === "jobs");
   const status = request.method === "GET" && operation.length === 2 &&
     name === "jobs" && !!id && /^[a-f0-9]{32}$/.test(id);
-  if (!submit && !status) {
+  const quota = request.method === "GET" && operation.length === 1 && name === "quota";
+  if (!submit && !status && !quota) {
     return NextResponse.json({ error: "Unknown inference operation" }, { status: 404 });
   }
   const token = request.headers.get("authorization")?.match(/^Bearer ([A-Za-z0-9_-]{32,128})$/i)?.[1];
@@ -35,6 +37,9 @@ async function proxy(request: Request, context: Context) {
     sha256: Hash.bind(null, "sha256"),
   });
   try {
+    if (!(await registerGuardedKey(token))) {
+      return NextResponse.json({ error: "Invalid API key", code: "INVALID_API_KEY" }, { status: 401 });
+    }
     const signed = await signer.sign({
       method: request.method,
       protocol: url.protocol,
