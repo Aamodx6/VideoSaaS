@@ -221,6 +221,13 @@ def encode_prediction(prediction, response_content_type):
 
 
 def model_fn(model_dir):
+    if os.getenv("REQUIRE_QUALITY_POLICY", "0") == "1" and not os.getenv("QUALITY_POLICY_PATH"):
+        raise ValueError("A calibrated quality policy is required for this deployment")
+    policy = None
+    if os.getenv("QUALITY_POLICY_PATH"):
+        from quality import prepare_policy
+        with open(os.environ["QUALITY_POLICY_PATH"], encoding="utf-8") as stream:
+            policy = prepare_policy(json.load(stream), os.environ["MODEL_VERSION"])
     # Load the model for inference
     if not install_ffmpeg():
         raise RuntimeError(
@@ -248,7 +255,8 @@ def model_fn(model_dir):
             "base",
             device="cpu" if device.type == "cpu" else device,
         ),
-        'device': device
+        'device': device,
+        'quality_policy': policy,
     }
 
 
@@ -314,20 +322,48 @@ def transform_fn(model, request_body, content_type, accept, context=None):
         print(json.dumps(observation.event(failed), separators=(",", ":"), allow_nan=False), flush=True)
 
 
-def predict_video(video_path, model_dict, temp_dir, observation=None):
+def predict_video(video_path, model_dict, temp_dir, observation=None, calibration_sink=None):
+    from quality import bleep_ratio, classify, distance, prepare_policy, quality_reason
+
     observation = observation or Observation(sample_rate=0)
     model = model_dict['model']
     tokenizer = model_dict['tokenizer']
     device = model_dict['device']
+    policy = model_dict.get("quality_policy")
+    if policy is None and os.getenv("QUALITY_POLICY_PATH"):
+        with open(os.environ["QUALITY_POLICY_PATH"], encoding="utf-8") as stream:
+            policy = json.load(stream)
+        policy = prepare_policy(policy, observation.model_version)
+        model_dict["quality_policy"] = policy
 
     request_stats(video_path, observation)
     with observation.stage("audio"):
-        audio = whisper.load_audio(video_path)
+        try:
+            audio = whisper.load_audio(video_path)
+        except RuntimeError:
+            if policy:
+                observation.stats.update(ood_detected=True, degraded_input=True, has_speech=False)
+                return {"status": "out_of_domain", "reason_code": "audio_unavailable", "utterances": []}
+            raise
         rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64)))) if audio.size else 0.0
         observation.stats["audio_loudness"] = float(max(-96.0, 20 * np.log10(max(rms, 1e-5))))
+        if policy:
+            observation.stats["silence_ratio"] = float(np.mean(np.abs(audio) < 0.003)) if audio.size else 1.0
+            observation.stats["bleep_ratio"] = bleep_ratio(audio)
     with observation.stage("text"):
         result = model_dict['transcriber'].transcribe(audio, word_timestamps=True)
         observation.stats["has_speech"] = bool(result["segments"])
+
+    if policy:
+        observation.stats.update(quality_frames(video_path))
+        scores = [float(np.exp(min(0, s["avg_logprob"]))) for s in result["segments"] if "avg_logprob" in s]
+        if scores:
+            observation.stats["transcript_confidence"] = float(np.mean(scores))
+        reason = ("audio_muted" if not result["segments"] else quality_reason(observation.stats, policy["limits"]))
+        observation.stats["degraded_input"] = bool(reason)
+        observation.stats["ood_detected"] = bool(reason)
+        if reason:
+            return {"status": "out_of_domain", "reason_code": reason, "utterances": []}
 
     utterance_processor = VideoUtteranceProcessor()
     predictions = []
@@ -350,10 +386,30 @@ def predict_video(video_path, model_dict, temp_dir, observation=None):
                 text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
                 video_frames = video_frames.unsqueeze(0).to(device)
                 audio_features = audio_features.unsqueeze(0).to(device)
-                outputs = model(text_inputs, video_frames, audio_features, return_embedding=observation.sampled)
-                emotion_probs = torch.softmax(outputs["emotions"], dim=1)[0]
+                outputs = model(text_inputs, video_frames, audio_features,
+                                return_embedding=observation.sampled or bool(policy) or calibration_sink is not None)
+                if calibration_sink is not None:
+                    if policy:
+                        raise ValueError("Calibration exports require uncalibrated predictions")
+                    calibration_sink.append({name: outputs[field][0].cpu().tolist() for name, field in (
+                        ("emotion_logits", "emotions"), ("sentiment_logits", "sentiments"),
+                        ("embeddings", "embedding"))})
+                temperatures = policy["temperature"] if policy else {"emotion": 1, "sentiment": 1}
+                emotion_probs = torch.softmax(outputs["emotions"] / temperatures["emotion"], dim=1)[0]
                 sentiment_probs = torch.softmax(
-                    outputs["sentiments"], dim=1)[0]
+                    outputs["sentiments"] / temperatures["sentiment"], dim=1)[0]
+
+                if policy:
+                    embedding_distance = distance(outputs["embedding"][0].tolist(), policy["mean"], policy["precision"])
+                    observation.stats["embedding_distance"] = embedding_distance
+                    status, reason = classify(
+                        observation.stats, (emotion_probs.tolist(), sentiment_probs.tolist()),
+                        embedding_distance,
+                        policy["limits"])
+                    if status != "ok":
+                        observation.stats["ood_detected"] = True
+                        observation.selected = None
+                        return {"status": status, "reason_code": reason, "utterances": []}
 
                 emotion_values, emotion_indices = torch.topk(emotion_probs, 3)
                 sentiment_values, sentiment_indices = torch.topk(
@@ -386,6 +442,38 @@ def predict_video(video_path, model_dict, temp_dir, observation=None):
     if result["segments"] and not predictions:
         raise RuntimeError("Inference failed for all transcribed segments")
     return {"utterances": predictions}
+
+
+def quality_frames(video_path):
+    capture = cv2.VideoCapture(video_path)
+    detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    blur = []
+    faces = 0
+    try:
+        frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        if not np.isfinite(frames) or frames < 1:
+            return {}
+        for index in np.linspace(0, int(frames) - 1, min(int(frames), 8), dtype=int):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+            ok, frame = capture.read()
+            if not ok:
+                continue
+            width = min(frame.shape[1], 480)
+            frame = cv2.resize(frame, (width, max(1, int(frame.shape[0] * width / frame.shape[1]))))
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blur.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
+            if not detector.empty():
+                faces += int(len(detector.detectMultiScale(gray, minNeighbors=4)) > 0)
+    finally:
+        capture.release()
+    if not blur:
+        return {}
+    stats = {"blur_score": float(np.median(blur))}
+    if not detector.empty():
+        stats["face_rate"] = faces / len(blur)
+    return stats
+
+
 
 
 # def process_local_video(video_path, model_dir="model_normalized"):
