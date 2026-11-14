@@ -2,10 +2,10 @@
 
 import { useState } from "react";
 
-function CodeExamples() {
+function CodeExamples({ guarded }: { guarded: boolean }) {
   const [activeTab, setActiveTab] = useState<"ts" | "curl">("ts");
 
-  const tsCode = `const fileType = ".mp4";
+  const legacyCode = `const fileType = ".mp4";
   // 1. Get upload URL
   const res = await fetch("/api/upload-url", {
     method: "POST",
@@ -53,7 +53,27 @@ function CodeExamples() {
 
   const analysis = await analysisRes.json();
 
-  console.log("Analysis: ", analysis);`;
+  // Display the analysis in your authenticated client.`;
+
+  const tsCode = guarded ? `const headers = {
+  Authorization: "Bearer " + apiKey,
+  "Content-Type": "application/json",
+};
+const signed = await fetch("/api/async-inference/uploads", {
+  method: "POST", headers, body: "{}",
+}).then(r => { if (!r.ok) throw new Error("Signing failed"); return r.json(); });
+const form = new FormData();
+for (const [key, value] of Object.entries(signed.fields)) form.append(key, String(value));
+form.append("file", file);
+const uploaded = await fetch(signed.url, { method: "POST", body: form });
+if (!uploaded.ok) throw new Error("Upload failed");
+const job = await fetch("/api/async-inference/jobs", {
+  method: "POST", headers, body: JSON.stringify({ upload_id: signed.upload_id }),
+}).then(r => { if (!r.ok) throw new Error("Submission failed"); return r.json(); });
+// Poll this path until SUCCEEDED, REVIEW, BLOCKED, or FAILED.
+const result = await fetch("/api/async-inference/jobs/" + job.job_id, { headers });
+// A successful job includes analysis. A block returns HTTP 422 and a reason code.
+// Read monthly usage from GET /api/async-inference/quota.` : legacyCode;
 
   const curlCode = `# 1. Get upload URL
 curl -X POST \\
@@ -81,7 +101,7 @@ curl -X POST \\
     <div className="mt-3 flex h-fit w-full flex-col rounded-xl bg-gray-100 bg-opacity-70 p-4">
       <span className="text-sm">API Usage</span>
       <span className="mb-4 text-sm text-gray-500">
-        Examples of how to use the API with TypeScript and cURL.
+        {guarded ? "Upload an MP4 and poll the moderated job." : "Examples of how to use the API with TypeScript and cURL."}
       </span>
 
       <div className="overflow-hidden rounded-md bg-gray-900">
@@ -92,12 +112,12 @@ curl -X POST \\
           >
             TypeScript
           </button>
-          <button
+          {!guarded && <button
             onClick={() => setActiveTab("curl")}
             className={`px-4 py-2 text-xs ${activeTab === "curl" ? "bg-gray-800 text-white" : "text-gray-400 hover:text-gray-300"}`}
           >
             cURL
-          </button>
+          </button>}
         </div>
         <div className="p-4">
           <pre className="max-h-[300px] overflow-y-auto text-xs text-gray-300">

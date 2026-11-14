@@ -8,6 +8,8 @@ from telemetry import DIMENSION_VALUE
 
 
 def deploy_endpoint():
+    if os.getenv("REQUIRE_QUALITY_POLICY", "1") == "1" and not os.getenv("QUALITY_POLICY_PATH"):
+        raise ValueError("Set QUALITY_POLICY_PATH to the calibrated artifact path before deploying")
     bucket = os.environ["INFERENCE_BUCKET"]
     endpoint = os.environ["ENDPOINT_NAME"]
     version = os.environ["MODEL_VERSION"]
@@ -49,6 +51,8 @@ def deploy_endpoint():
             "ENDPOINT_NAME": endpoint,
             "MODEL_VERSION": version,
             "DRIFT_SAMPLE_RATE": str(sample_rate),
+            "QUALITY_POLICY_PATH": os.getenv("QUALITY_POLICY_PATH", ""),
+            "REQUIRE_QUALITY_POLICY": os.getenv("REQUIRE_QUALITY_POLICY", "1"),
             "INFERENCE_BUCKET": bucket,
             "INFERENCE_INPUT_PREFIX": os.getenv("INFERENCE_INPUT_PREFIX", "inference/uploads/"),
         },

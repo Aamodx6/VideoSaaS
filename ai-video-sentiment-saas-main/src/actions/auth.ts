@@ -41,10 +41,9 @@ export async function registerUser(data: SignupSchema) {
 
     return { success: true };
   } catch (error) {
-    console.error("registerUser error:", error);
+    console.error("User registration failed");
     return {
-      error:
-        error instanceof Error ? error.message : "Something went wrong",
+      error: "Could not create account",
     };
   }
 }

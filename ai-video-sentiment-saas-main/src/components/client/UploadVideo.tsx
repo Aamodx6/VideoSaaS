@@ -1,15 +1,19 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FiUpload } from "react-icons/fi";
 import type { Analysis } from "./Inference";
+import { guardedUpload } from "~/lib/guarded-upload";
 
 interface UploadVideoProps {
+  guarded: boolean;
   apiKey: string;
   onAnalysis: (analysis: Analysis) => void;
 }
 
-function UploadVideo({ apiKey, onAnalysis }: UploadVideoProps) {
+function UploadVideo({ apiKey, onAnalysis, guarded }: UploadVideoProps) {
+  const active = useRef<AbortController>();
+  useEffect(() => () => active.current?.abort(), []);
   const [status, setStatus] = useState<"idle" | "uploading" | "analyzing">(
     "idle",
   );
@@ -19,6 +23,12 @@ function UploadVideo({ apiKey, onAnalysis }: UploadVideoProps) {
     try {
       setStatus("uploading");
       setError(null);
+      active.current = new AbortController();
+      if (guarded) {
+        setStatus("analyzing");
+        onAnalysis(await guardedUpload(file, apiKey, active.current.signal));
+        return;
+      }
 
       const fileType = `.${file.name.split(".").pop()}`;
 
@@ -86,7 +96,7 @@ function UploadVideo({ apiKey, onAnalysis }: UploadVideoProps) {
       <div className="flex w-full cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-gray-300 p-10">
         <input
           type="file"
-          accept=".mp4,.mov,.avi"
+          accept={guarded ? ".mp4" : ".mp4,.mov,.avi"}
           className="hidden"
           onChange={(e) => {
             const file = e.target.files?.[0];

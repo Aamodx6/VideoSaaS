@@ -8,8 +8,11 @@ import { env } from "~/env";
 import { correlation, emotion, feedbackToken, logSageMakerThrottle, sentiment } from "~/lib/inference-observability";
 import { checkAndUpdateQuota } from "~/lib/quota";
 import { db } from "~/server/db";
+import { moderationRequired } from "~/lib/guardrails";
 
 const analysisSchema = z.object({
+  status: z.enum(["low_confidence", "out_of_domain"]).optional(),
+  reason_code: z.string().optional(),
   model_version: z.string().optional(),
   utterances: z.array(z.object({
     start_time: z.number(), end_time: z.number(), text: z.string(),
@@ -19,6 +22,9 @@ const analysisSchema = z.object({
 });
 
 export async function POST(req: Request) {
+  if (moderationRequired()) {
+    return NextResponse.json({ error: "Use guarded uploads", code: "MODERATED_UPLOAD_REQUIRED" }, { status: 403 });
+  }
   try {
     // Get API key from the header
     const apiKey = req.headers.get("Authorization")?.replace("Bearer ", "");
@@ -123,7 +129,7 @@ export async function POST(req: Request) {
       logSageMakerThrottle();
       return NextResponse.json({ error: "Inference capacity is busy" }, { status: 503 });
     }
-    console.error("Sentiment inference failed:", error);
+    console.error("Sentiment inference failed");
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 },

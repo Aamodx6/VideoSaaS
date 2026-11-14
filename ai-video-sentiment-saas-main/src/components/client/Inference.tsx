@@ -20,13 +20,17 @@ const SENTIMENT_EMOJI: Record<string, string> = {
 };
 
 interface InferenceProps {
+  guarded: boolean;
   quota: {
     secretKey: string;
   };
 }
 
 export type Analysis = {
+  account_policy?: "active" | "warn" | "throttle" | "suspend";
   analysis: {
+    status?: "low_confidence" | "out_of_domain";
+    reason_code?: string;
     utterances: Array<{
       start_time: number;
       end_time: number;
@@ -38,7 +42,7 @@ export type Analysis = {
   };
 };
 
-export function Inference({ quota }: InferenceProps) {
+export function Inference({ quota, guarded }: InferenceProps) {
   const [analysis, setAnalysis] = useState<Analysis | null>();
 
   const getAverageScores = () => {
@@ -91,7 +95,21 @@ export function Inference({ quota }: InferenceProps) {
   return (
     <div className="flex h-fit w-full flex-col gap-3 md:w-1/2">
       <h2 className="text-lg font-medium text-slate-800">Analyze a video</h2>
-      <UploadVideo onAnalysis={setAnalysis} apiKey={quota.secretKey} />
+      <UploadVideo onAnalysis={setAnalysis} apiKey={quota.secretKey} guarded={guarded} />
+      {(analysis?.account_policy === "warn" || analysis?.account_policy === "throttle") && (
+        <p role="status" className="text-sm text-amber-700">
+          Your account has content policy warnings.
+          {analysis.account_policy === "throttle" ? " Uploads are currently rate limited." : ""}
+        </p>
+      )}
+      {analysis?.analysis.status && (
+        <p role="status" className="text-sm text-slate-700">
+          {analysis.analysis.status === "low_confidence"
+            ? "The model could not make a confident prediction."
+            : "This video is outside the model’s supported input."}
+          {analysis.analysis.reason_code ? ` (${analysis.analysis.reason_code})` : ""}
+        </p>
+      )}
 
       <h2 className="mt-2 text-sm font-medium text-slate-800">Overall analysis</h2>
       {averages?.topEmotion && averages.topSentiment ? (

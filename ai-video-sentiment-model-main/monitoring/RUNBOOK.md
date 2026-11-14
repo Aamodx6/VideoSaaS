@@ -11,3 +11,8 @@ Check `DriftSampleCount` and baseline coverage before interpreting a signal. Rea
 ## Pipeline
 
 Check the Firehose delivery stream, source subscription, the normalizer's logs and `firehose-errors/`. Verify the prefix in S3 for the affected UTC hour and check Lambda permissions, memory, timeouts and the deployed version's immutable baseline. Confirm the Athena date and hour filters cover Firehose arrival time. If one drift window missed late records, wait for S3 delivery and replay the original EventBridge `time` into the drift Lambda. Check SNS subscription confirmation and composite alarm history if notifications are missing.
+# Input quality and moderation
+
+## Input quality
+
+Check the serving model version and policy artifact if OOD or degraded input rises. Compare confidence, entropy, and held-out quality scores against the previous release. Verify that the moderation workflow, GuardDuty scans, and managed job completions are healthy if block rates move unexpectedly. Inspect aggregate counts and reason codes. Keep transcripts and unsafe media out of operational logs and training datasets. Leave ambiguous uploads in review pending authorized disposition.

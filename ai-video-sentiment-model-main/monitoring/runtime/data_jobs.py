@@ -19,7 +19,7 @@ s3 = boto3.client("s3", config=Config(signature_version="s3v4", s3={"addressing_
 encode = TypeSerializer().serialize
 decode = TypeDeserializer().deserialize
 UUID = re.compile(r"[a-f0-9]{32}")
-MAX_VIDEO_BYTES = 512 * 1024**2
+MAX_VIDEO_BYTES = int(os.getenv("MAX_VIDEO_BYTES", str(128 * 1024**2)))
 
 
 def item(values):
@@ -31,8 +31,8 @@ def fetch(table, **key):
     return {k: decode(v) for k, v in response.get("Item", {}).items()}
 
 
-def reply(status, **body):
-    return {"statusCode": status, "headers": {"Content-Type": "application/json", "Cache-Control": "no-store"},
+def reply(status_code, **body):
+    return {"statusCode": status_code, "headers": {"Content-Type": "application/json", "Cache-Control": "no-store"},
             "body": json.dumps(body)}
 
 
@@ -87,18 +87,40 @@ def api(event, _context):
     if not identity or identity.get("revoked") or identity.get("expires_at", 0) <= now:
         return reply(401, error="Invalid API key")
     tenant, user = identity["tenant_id"], identity["user_id"]
-    if not rate_allowed(tenant, now, int(identity.get("rate_per_minute", 60))):
+    quarantine = os.getenv("QUARANTINE")
+    policy = "active"
+    if quarantine and event["httpMethod"] == "POST":
+        from safety_store import account_policy
+        try:
+            policy = account_policy(tenant, user)
+        except Exception:
+            return reply(503, code="SAFETY_CHECK_UNAVAILABLE", error="Safety verification unavailable")
+        if policy == "suspend":
+            return reply(403, code="ACCOUNT_SUSPENDED", error="Account suspended")
+    rate = int(identity.get("rate_per_minute", 60))
+    if policy == "throttle":
+        rate = min(rate, 5)
+    if not rate_allowed(tenant, now, rate):
         return reply(429, error="Rate limit exceeded")
     period = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m")
     if event["httpMethod"] == "GET":
+        if event.get("resource") == "/quota":
+            counter = fetch("QUOTAS", tenant_id=tenant, period=period)
+            return reply(200, period=period, requests_used=int(counter.get("used", 0)),
+                         max_requests=int(identity["monthly_limit"]))
         job_id = (event.get("pathParameters") or {}).get("jobId", "")
         job = fetch("JOBS", tenant_id=tenant, job_id=job_id)
         if not job or job.get("user_id") != user or job["expires_at"] <= now:
             return reply(404, error="Job not found")
-        output = {"job_id": job_id, "status": job["status"]}
+        output = {"job_id": job_id, "status": job["status"], "account_policy": job.get("account_policy", "active")}
+        if job["status"] == "BLOCKED":
+            return reply(422, **output, code=job["moderation_code"])
         if job["status"] == "SUCCEEDED":
-            output["result_url"] = s3.generate_presigned_url("get_object", Params={
-                "Bucket": os.environ["RESULTS"], "Key": job["result_key"]}, ExpiresIn=300)
+            result = s3.get_object(Bucket=os.environ["RESULTS"], Key=job["result_key"])
+            if result["ContentLength"] > 1024**2:
+                return reply(413, code="RESULT_TOO_LARGE", error="Analysis exceeds result limit")
+            with result["Body"] as stream:
+                output["analysis"] = json.load(stream)
         return reply(200, **output)
     try:
         payload = json.loads(event.get("body") or "{}")
@@ -111,6 +133,12 @@ def api(event, _context):
             return reply(429, error="Monthly quota exceeded")
         upload_id = uuid.uuid4().hex
         key = f"uploads/{tenant}/{user}/{upload_id}.mp4"
+        if quarantine:
+            upload = s3.generate_presigned_post(
+                quarantine, key, Fields={"Content-Type": "video/mp4"},
+                Conditions=[{"Content-Type": "video/mp4"}, ["content-length-range", 1, MAX_VIDEO_BYTES]],
+                ExpiresIn=600)
+            return reply(200, upload_id=upload_id, method="POST", **upload)
         url = s3.generate_presigned_url("put_object", Params={
             "Bucket": os.environ["VIDEOS"], "Key": key, "ContentType": "video/mp4",
             "IfNoneMatch": "*"}, ExpiresIn=600)
@@ -125,13 +153,16 @@ def api(event, _context):
     if existing:
         return reply(202, job_id=job_id) if existing["user_id"] == user else reply(404, error="Job not found")
     try:
-        uploaded = s3.head_object(Bucket=os.environ["VIDEOS"], Key=key)
+        uploaded = s3.head_object(Bucket=quarantine or os.environ["VIDEOS"], Key=key)
     except ClientError as exc:
         if exc.response["ResponseMetadata"]["HTTPStatusCode"] in (403, 404):
             return reply(404, error="Upload not found")
         raise
     if not 0 < uploaded["ContentLength"] <= MAX_VIDEO_BYTES:
         return reply(413, error="Video exceeds upload limits")
+    if quarantine and not uploaded.get("VersionId"):
+        return reply(503, error="Upload version unavailable")
+    moderation_fields = {"upload_version": uploaded["VersionId"]} if quarantine else {}
     try:
         ddb.transact_write_items(TransactItems=[
             {"Update": {"TableName": os.environ["QUOTAS"], "Key": item({"tenant_id": tenant, "period": period}),
@@ -140,8 +171,11 @@ def api(event, _context):
                         "ExpressionAttributeValues": item({":ttl": now + 93 * 86400, ":one": 1,
                                                            ":limit": identity["monthly_limit"]})}},
             {"Put": {"TableName": os.environ["JOBS"], "ConditionExpression": "attribute_not_exists(job_id)",
-                     "Item": item({"tenant_id": tenant, "job_id": job_id, "user_id": user, "status": "QUEUED",
-                                   "video_key": key, "created_at": now, "expires_at": now + 30 * 86400})}},
+                     "Item": item({"tenant_id": tenant, "job_id": job_id, "user_id": user,
+                                   "status": "PENDING_MODERATION" if quarantine else "QUEUED",
+                                   "account_policy": policy,
+                                   "video_key": key, "created_at": now, "expires_at": now + 30 * 86400,
+                                   **moderation_fields})}},
         ])
     except ddb.exceptions.TransactionCanceledException as exc:
         reasons = exc.response.get("CancellationReasons", [])
@@ -158,8 +192,16 @@ def dispatch(event, _context):
     sqs = boto3.client("sqs")
     for record in event["Records"]:
         row = record["dynamodb"]["NewImage"]
-        sqs.send_message(QueueUrl=os.environ["QUEUE"], MessageBody=json.dumps({
-            key: row[key]["S"] for key in ("tenant_id", "job_id")}))
+        payload = json.dumps({key: row[key]["S"] for key in ("tenant_id", "job_id")})
+        if row["status"]["S"] == "PENDING_MODERATION":
+            machine = boto3.client("stepfunctions")
+            try:
+                machine.start_execution(stateMachineArn=os.environ["MODERATION_WORKFLOW"],
+                                        name=row["job_id"]["S"], input=payload)
+            except machine.exceptions.ExecutionAlreadyExists:
+                continue
+        else:
+            sqs.send_message(QueueUrl=os.environ["QUEUE"], MessageBody=payload)
 
 
 def submit(event, _context):
@@ -169,6 +211,18 @@ def submit(event, _context):
         job = fetch("JOBS", **identity)
         if not job or job["status"] not in ("QUEUED", "SUBMITTING"):
             continue
+        if os.getenv("QUARANTINE") and job.get("moderation_decision") != "PASS":
+            raise RuntimeError("Job has no moderation approval")
+        if os.getenv("QUARANTINE"):
+            from safety_store import account_policy
+            if account_policy(job["tenant_id"], job["user_id"]) == "suspend":
+                ddb.update_item(TableName=os.environ["JOBS"], Key=item(identity),
+                                UpdateExpression="SET #status = :blocked, moderation_code = :code",
+                                ConditionExpression="#status = :queued",
+                                ExpressionAttributeNames={"#status": "status"},
+                                ExpressionAttributeValues=item({":queued": "QUEUED", ":blocked": "BLOCKED",
+                                                                 ":code": "ACCOUNT_SUSPENDED"}))
+                continue
         key = f"requests/{job['tenant_id']}/{job['user_id']}/{job['job_id']}.json"
         s3.put_object(Bucket=os.environ["VIDEOS"], Key=key, ContentType="application/json",
                       Body=json.dumps({"video_path": f"s3://{os.environ['VIDEOS']}/{job['video_key']}"}))

@@ -43,6 +43,12 @@ class DataArchitecture(Construct):
         self.jobs = self.table("InferenceJobs", "tenant_id", "job_id", [
             ("ByJob", "job_id", None), ("ByUser", "user_id", "job_id"),
         ], stream=True)
+        if os.getenv("ENABLE_MODERATION") == "1":
+            self.jobs.add_global_secondary_index(
+                index_name="ByReviewTenant",
+                partition_key=ddb.Attribute(name="review_tenant", type=ddb.AttributeType.STRING),
+                sort_key=ddb.Attribute(name="job_id", type=ddb.AttributeType.STRING),
+                projection_type=ddb.ProjectionType.KEYS_ONLY)
         self.database()
         self.analytics()
         DataPipeline(self, "Inference", self)
@@ -53,7 +59,7 @@ class DataArchitecture(Construct):
     def key(self, name):
         return kms.Key(self, name, enable_key_rotation=True, removal_policy=cdk.RemovalPolicy.RETAIN)
 
-    def bucket(self, name, retention, cors=False, event_bridge=False):
+    def bucket(self, name, retention, cors=False, event_bridge=False, post=False):
         rule = s3.LifecycleRule(
             expiration=cdk.Duration.days(retention) if retention else None,
             noncurrent_version_expiration=cdk.Duration.days(7) if retention else None,
@@ -66,7 +72,8 @@ class DataArchitecture(Construct):
             removal_policy=cdk.RemovalPolicy.RETAIN, lifecycle_rules=[rule],
             event_bridge_enabled=event_bridge,
             cors=[s3.CorsRule(allowed_origins=[os.environ["APP_ORIGIN"]],
-                             allowed_methods=[s3.HttpMethods.PUT], allowed_headers=["content-type", "if-none-match"])]
+                             allowed_methods=[s3.HttpMethods.POST if post else s3.HttpMethods.PUT],
+                             allowed_headers=["content-type", "if-none-match"])]
             if cors else None,
         )
         self.output(name + "BucketName", bucket.bucket_name)
@@ -112,7 +119,11 @@ class DataArchitecture(Construct):
             backup=rds.BackupProps(retention=cdk.Duration.days(35)),
             deletion_protection=True, removal_policy=cdk.RemovalPolicy.SNAPSHOT,
             parameters={"rds.force_ssl": "1"},
+            enable_data_api=True,
         )
+        self.safety_cluster = cluster
+        self.safety_secret = rds.DatabaseSecret(self, "SafetySecret", username="aspect_safety",
+                                                encryption_key=self.key("SafetySecretKey"))
         rotation_sg = ec2.SecurityGroup(self, "RotationSecurityGroup", vpc=self.vpc)
         db_sg.add_ingress_rule(rotation_sg, ec2.Port.tcp(5432))
         self.vpc.node.find_child("Secrets").connections.allow_from(rotation_sg, ec2.Port.tcp(443))
@@ -124,9 +135,14 @@ class DataArchitecture(Construct):
                                         encryption_key=self.key("ApplicationSecretKey"))
         proxy = cluster.add_proxy("Proxy", secrets=[app_secret], vpc=self.vpc,
                                   vpc_subnets=subnets, security_groups=[proxy_sg], require_tls=True)
-        cluster.add_rotation_multi_user("RotateApplicationSecret", secret=app_secret,
-                                        automatically_after=cdk.Duration.days(30),
-                                        security_group=rotation_sg, vpc_subnets=subnets)
+        if os.getenv("ENABLE_DATABASE_ROTATION") == "1":
+            cluster.add_rotation_multi_user("RotateApplicationSecret", secret=app_secret,
+                                            automatically_after=cdk.Duration.days(30),
+                                            security_group=rotation_sg, vpc_subnets=subnets)
+            cluster.add_rotation_multi_user("RotateSafetySecret", secret=self.safety_secret,
+                                            automatically_after=cdk.Duration.days(30),
+                                            security_group=rotation_sg, vpc_subnets=subnets)
+        self.output("SafetySecretArn", self.safety_secret.secret_arn)
         self.output("ProxyEndpoint", proxy.endpoint)
         self.output("ApplicationSecretArn", app_secret.secret_arn)
         self.output("DatabaseAdminSecretArn", cluster.secret.secret_arn)
@@ -142,6 +158,11 @@ class DataArchitecture(Construct):
             security_group_ids=[cache_sg.security_group_id],
         )
         self.output("ValkeyEndpoint", self.valkey.attr_endpoint_address)
+
+    def grant_safety_access(self, handler):
+        handler.add_to_role_policy(iam.PolicyStatement(
+            actions=["rds-data:ExecuteStatement"], resources=[self.safety_cluster.cluster_arn]))
+        self.safety_secret.grant_read(handler)
 
     def analytics(self):
         database = glue.CfnDatabase(self, "LakeDatabase", catalog_id=self.stack.account,

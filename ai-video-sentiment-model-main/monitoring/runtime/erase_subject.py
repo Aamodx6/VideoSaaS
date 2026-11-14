@@ -41,7 +41,7 @@ def erase(user, tenants):
     for row in rows:
         identity = {k: row[k] for k in ("tenant_id", "job_id")}
         current = jobs.get_item(Key=identity, ConsistentRead=True).get("Item", {})
-        if current.get("status") in ("SUBMITTING", "RUNNING"):
+        if current.get("status") in ("PENDING_MODERATION", "MODERATION_COMMITTING", "REVIEW_COMMITTING", "SUBMITTING", "RUNNING"):
             active.append(identity)
         elif current.get("status") == "QUEUED":
             jobs.update_item(Key=identity, UpdateExpression="SET #status = :erased",
@@ -53,11 +53,19 @@ def erase(user, tenants):
     for tenant in set(tenants) | {r["tenant_id"] for r in rows}:
         for prefix in ("uploads", "requests"):
             delete_versions(s3, os.environ["VIDEOS"], f"{prefix}/{tenant}/{user}/")
+        if os.getenv("QUARANTINE"):
+            for prefix in ("uploads", "checked", "hold"):
+                delete_versions(s3, os.environ["QUARANTINE"], f"{prefix}/{tenant}/{user}/")
     for row in rows:
         current = jobs.get_item(Key={k: row[k] for k in ("tenant_id", "job_id")},
                                 ConsistentRead=True).get("Item", {})
         if current.get("result_key"):
             delete_versions(s3, os.environ["RESULTS"], current["result_key"], exact=True)
+        if os.getenv("QUARANTINE"):
+            delete_versions(s3, os.environ["QUARANTINE"],
+                            f"toxicity/moderation-{row['job_id']}.json", exact=True)
+            delete_versions(s3, os.environ["QUARANTINE"],
+                            f"toxicity/language-{row['job_id']}.json", exact=True)
         # SageMaker returns an output and failure pointer at submission time.
         for field in ("expected_output", "expected_failure"):
             if current.get(field):
@@ -65,6 +73,10 @@ def erase(user, tenants):
         jobs.delete_item(Key={k: row[k] for k in ("tenant_id", "job_id")})
     for row in list(by_user(keys, user)):
         keys.delete_item(Key={"key_hash": row["key_hash"]})
+    if os.getenv("SAFETY_CLUSTER_ARN"):
+        from safety_store import execute
+        execute("DELETE FROM aspect.strikes WHERE user_id=:subject", subject=user)
+        execute("DELETE FROM aspect.moderation_events WHERE user_id=:subject", subject=user)
 
 
 if __name__ == "__main__":

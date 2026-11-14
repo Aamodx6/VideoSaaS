@@ -96,6 +96,9 @@ class Observation:
         ):
             if field in self.stats:
                 fields[name] = (int(self.stats[field]) if field == "has_speech" else self.stats[field], unit)
+        if "ood_detected" in self.stats:
+            fields["OodRate"] = (int(self.stats["ood_detected"]), "None")
+            fields["DegradedInputRate"] = (int(self.stats["degraded_input"]), "None")
         timestamp = int(time.time() * 1000)
         entry = {
             "event_type": EVENT, "timestamp_ms": timestamp, "event_id": self.event_id,

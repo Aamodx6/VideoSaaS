@@ -3,8 +3,15 @@ import { db } from "~/server/db";
 import { checkNeonAuthStatus } from "~/lib/neon-auth";
 import { getNeonAIModels } from "~/lib/neon-ai";
 import { checkNeonRealtimeConfig } from "~/lib/neon-realtime";
+import { timingSafeEqual } from "node:crypto";
 
-export async function GET() {
+export async function GET(request: Request) {
+  const expected = process.env.DIAGNOSTICS_TOKEN;
+  const supplied = request.headers.get("authorization")?.replace(/^Bearer /, "");
+  if (!expected || expected.length < 32 || !supplied || Buffer.byteLength(expected) !== Buffer.byteLength(supplied) ||
+      !timingSafeEqual(Buffer.from(expected), Buffer.from(supplied))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const results: Record<string, unknown> = {};
 
   // 1. Test Neon Postgres

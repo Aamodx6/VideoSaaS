@@ -266,6 +266,7 @@ class Monitoring(cdk.Stack):
 
     def alarms(self):
         topic = sns.Topic(self, "Alerts")
+        self.alert_topic = topic
         if os.getenv("ALERT_EMAIL"):
             topic.add_subscription(subscriptions.EmailSubscription(os.environ["ALERT_EMAIL"]))
         action = cw_actions.SnsAction(topic)
@@ -294,6 +295,13 @@ class Monitoring(cdk.Stack):
         drift = alarm("DriftScore", self.quality[0], 1, "drift")
         confidence = alarm("ConfidenceDrop", self.custom("ConfidenceDrop"), numeric("CONFIDENCE_DROP", .08), "drift")
         no_speech = alarm("NoSpeechRate", self.custom("NoSpeechIncrease"), numeric("NO_SPEECH_INCREASE", .20), "drift")
+        self.input_quality = [self.custom(name, "VideoSentiment/Inference", period=5)
+                              for name in ("OodRate", "DegradedInputRate")]
+        self.moderation_rate = cw.Metric(namespace="VideoSentiment/Moderation",
+                                        metric_name="ModerationBlockRate", statistic="Average",
+                                        period=cdk.Duration.minutes(5))
+        ood = alarm("OutOfDomain", self.input_quality[0], numeric("OOD_ALARM_RATE", .20), "input-quality")
+        blocked = alarm("ModerationBlocks", self.moderation_rate, numeric("BLOCK_ALARM_RATE", .15), "input-quality")
         job_errors = [alarm(f"{label}JobErrors", function.metric_errors(period=cdk.Duration.hours(1)), 1, "pipeline")
                       for label, function in zip(("Drift", "Accuracy"), self.jobs_to_watch)]
         delivery_errors = alarm("NormalizeErrors", self.delivery_function.metric_errors(
@@ -304,7 +312,7 @@ class Monitoring(cdk.Stack):
         for label, section, rule in (
             ("Serving", "serving", cw.AlarmRule.any_of(errors, throttles, cw.AlarmRule.all_of(p95, p99),
                                                        cw.AlarmRule.all_of(gpu, p95))),
-            ("Quality", "drift", cw.AlarmRule.any_of(drift, confidence, no_speech)),
+            ("Quality", "drift", cw.AlarmRule.any_of(drift, confidence, no_speech, ood, blocked)),
             ("Pipeline", "pipeline", cw.AlarmRule.any_of(*job_errors, delivery_errors, freshness)),
         ):
             composite = cw.CompositeAlarm(self, label, alarm_rule=rule,
@@ -313,6 +321,8 @@ class Monitoring(cdk.Stack):
 
     def dashboard(self):
         dashboard = cw.Dashboard(self, "Dashboard", dashboard_name=f"{self.endpoint}-monitoring")
+        dashboard.add_widgets(cw.GraphWidget(title="Input quality and moderation rates",
+                                             left=[*self.input_quality, self.moderation_rate]))
         dashboard.add_widgets(
             cw.GraphWidget(title="Traffic", left=[self.aws_metric("Invocations"), self.throttles]),
             cw.GraphWidget(title="Latency (microseconds)", left=self.latencies),

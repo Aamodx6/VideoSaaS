@@ -2,6 +2,8 @@
 
 ## Verified serving path
 
+Guarded uploads now use the optional async route by default. The synchronous path below remains a private demo option with REQUIRE_MODERATION=0. See the [guardrail architecture and release steps](SAFETY_AND_MODEL_QUALITY.md).
+
 This path passed a live browser test before the real-time GPU endpoint was removed to stop idle charges. The [hosting guide](HOSTING.md#restore-the-real-time-demo) records how to restore it.
 
 ```mermaid

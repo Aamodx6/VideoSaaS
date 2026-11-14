@@ -3,8 +3,12 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { NextResponse } from "next/server";
 import { env } from "~/env";
 import { db } from "~/server/db";
+import { moderationRequired } from "~/lib/guardrails";
 
 export async function POST(req: Request) {
+  if (moderationRequired()) {
+    return NextResponse.json({ error: "Use guarded uploads", code: "MODERATED_UPLOAD_REQUIRED" }, { status: 403 });
+  }
   try {
     // Get API key from the header
     const apiKey = req.headers.get("Authorization")?.replace("Bearer ", "");
@@ -73,7 +77,7 @@ export async function POST(req: Request) {
       key,
     });
   } catch (error) {
-    console.error("Video upload URL creation failed:", error);
+    console.error("Video upload URL creation failed");
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 },
